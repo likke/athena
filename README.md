@@ -18,14 +18,16 @@ The app is designed to work against the same SQLite database already used by the
 - `athena.outbox`: Gmail draft, approval, reject, and send state
 - `athena.render_markdown`: generated compatibility views for Telegram bucket files
 - `athena.sync`: life-doc, awareness-brief, and repo-status sync commands
+- `athena.synthesis`: weekly CEO brief generation from local Athena state
 - `athena.google`: local Google OAuth and Gmail / Calendar / Drive / NotebookLM helpers
-- `athena.server`: local HTTP dashboard / board with batch email approvals
+- `athena.server`: local HTTP dashboard / board with batch email approvals and a briefs view
 
 ## Default Data Paths
 
 By default Athena reads and writes:
 
 - DB: `~/.openclaw/workspace/system/task-ledger/tasks.sqlite`
+- weekly briefs: `~/.openclaw/workspace/system/briefs/`
 - life docs: `~/.openclaw/workspace/life/`
 - Google config: `~/.openclaw/workspace/system/google/`
 - Google mirror cache: `~/.openclaw/workspace/system/google-mirror/`
@@ -39,6 +41,7 @@ These can be overridden with environment variables when needed.
 cd /Users/fleirecastro/athena
 python3 -m athena.taskctl current
 python3 -m athena.sync all
+python3 -m athena.sync weekly-brief
 python3 -m athena.server --host 127.0.0.1 --port 8765
 ```
 
@@ -152,6 +155,23 @@ If Google sync reports a `calendar_error` with `accessNotConfigured`, the Google
 
 The important rule is: NotebookLM is not the source of truth. Athena mirrors the useful parts into local files and then ingests those into the normal `source_documents` layer.
 
+## Weekly CEO Brief
+
+Athena can generate a founder-facing weekly packet from the local life, portfolio, execution, outbox, and mirrored calendar layers.
+
+```bash
+python3 -m athena.sync weekly-brief
+```
+
+That writes:
+
+- a versioned brief into `~/.openclaw/workspace/system/briefs/`
+- a convenience copy at `LATEST_WEEKLY_CEO_BRIEF.md` in that same folder
+- a `weekly_ceo_brief` source document in the SQLite DB
+- a cheap global `weekly_ceo` awareness brief for chat loads
+
+The board also exposes this at `http://127.0.0.1:8765/briefs`, and running the weekly review from the board regenerates the latest brief.
+
 ## Email Outbox
 
 Athena now has a local `outbox_items` queue in the same SQLite database as tasks and projects.
@@ -164,10 +184,13 @@ Athena now has a local `outbox_items` queue in the same SQLite database as tasks
 Useful commands:
 
 ```bash
-python3 -m athena.taskctl queue-email --to "person@example.com" --subject "Follow-up" --body "Draft body"
+python3 -m athena.taskctl queue-email --account athena --to "person@example.com" --subject "Follow-up" --body "Draft body"
 python3 -m athena.taskctl approve-outbox outbox-follow-up
 python3 -m athena.taskctl send-outbox
+python3 -m athena.google login --account athena
 ```
+
+If you configure multiple Gmail identities in `~/.openclaw/workspace/system/google/settings.json`, Athena can keep separate sender labels and optional account-specific token files. The default setup now expects an `athena` sender identity for Athena-owned task mail.
 
 ## Goals
 

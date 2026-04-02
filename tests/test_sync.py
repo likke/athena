@@ -8,6 +8,7 @@ from pathlib import Path
 
 from athena.config import default_paths
 from athena.db import connect_db, ensure_db, now_ts
+from athena.synthesis import LATEST_WEEKLY_CEO_BRIEF, WEEKLY_CEO_BRIEF_KIND
 from athena.sync import (
     NOTEBOOKLM_LIFE_BUNDLE,
     ensure_notebooklm_life_bundle,
@@ -25,6 +26,7 @@ def _test_paths(tmp_dir: Path):
         "db_path": tmp_dir / "tasks.sqlite",
         "workspace_root": tmp_dir / "workspace",
         "workspace_telegram_root": tmp_dir / "workspace-telegram",
+        "briefs_dir": tmp_dir / "workspace" / "system" / "briefs",
         "life_dir": tmp_dir / "life",
         "notebooklm_export_dir": tmp_dir / "life" / "notebooklm-exports",
         "google_dir": tmp_dir / "workspace" / "system" / "google",
@@ -235,6 +237,175 @@ class SyncTestCase(unittest.TestCase):
                 self.assertEqual(row["source_system"], "NotebookLM")
                 self.assertEqual(row["kind"], "notebooklm")
                 self.assertEqual(row["summary"], "This file is generated from Athena's canonical local life docs.")
+
+    def test_run_sync_weekly_brief_generates_file_and_source_document(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            paths = _test_paths(tmp)
+            ensure_db(paths=paths)
+            calendar_dir = paths.google_mirror_dir / "calendar"
+            calendar_dir.mkdir(parents=True, exist_ok=True)
+            agenda_path = calendar_dir / "upcoming-summary.md"
+            agenda_path.write_text(
+                "\n".join(
+                    [
+                        "## primary",
+                        "",
+                        "- 2026-04-03 10:00 — Founder review",
+                        "- 2026-04-04 14:00 — Client call",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with connect_db(paths.db_path) as conn:
+                now = now_ts()
+                conn.execute(
+                    "INSERT INTO life_areas (id, slug, name, status, priority, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("area", "core", "Core", "active", 10, now, now),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO life_goals (
+                      id, life_area_id, slug, title, horizon, status, current_focus, supporting_rule,
+                      risk_if_ignored, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "goal",
+                        "area",
+                        "goal",
+                        "Protect founder focus",
+                        "quarter",
+                        "active",
+                        "Keep DashoContent revenue work ahead of side quests",
+                        "Revenue before random motion",
+                        "Priority drift",
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO portfolios (id, slug, name, status, priority, review_cadence, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("portfolio", "dasho", "DashoContent", "active", 50, "weekly", now, now),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO projects (
+                      id, life_area_id, life_goal_id, portfolio_id, slug, name, kind, tier, status, health,
+                      current_goal, next_milestone, blocker, last_real_progress_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "project",
+                        "area",
+                        "goal",
+                        "portfolio",
+                        "brand-score",
+                        "Brand score MVP",
+                        "product",
+                        "core",
+                        "blocked",
+                        "yellow",
+                        "Ship the scoring pass",
+                        "Lock first production test",
+                        "Need final scoring rule decision",
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO tasks (
+                      id, title, owner, bucket, status, priority, project_id, portfolio_id, life_goal_id,
+                      blocker, requires_approval, created_at, updated_at, last_touched_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "task",
+                        "Approve scoring note",
+                        "ATHENA",
+                        "BLOCKED",
+                        "blocked",
+                        10,
+                        "project",
+                        "portfolio",
+                        "goal",
+                        "Waiting on founder decision",
+                        1,
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO outbox_items (
+                      id, task_id, project_id, provider, account_label, to_recipients, subject, body_text, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "outbox",
+                        "task",
+                        "project",
+                        "gmail",
+                        "athena",
+                        "founder@example.com",
+                        "Need your sign-off",
+                        "Please approve the scoring decision.",
+                        "needs_approval",
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO source_documents (
+                      id, kind, title, path, source_system, is_authoritative, last_synced_at, summary, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "agenda",
+                        "calendar_agenda",
+                        "Upcoming Calendar Agenda",
+                        str(agenda_path.resolve()),
+                        "gcal",
+                        0,
+                        now,
+                        "2 mirrored calendar events",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            result = run_sync("weekly-brief", paths=paths)
+
+            brief_path = Path(str(result["weekly_brief_path"]))
+            self.assertTrue(brief_path.exists())
+            self.assertTrue((paths.briefs_dir / LATEST_WEEKLY_CEO_BRIEF).exists())
+            content = brief_path.read_text(encoding="utf-8")
+            self.assertIn("Athena CEO Weekly Brief", content)
+            self.assertIn("Protect founder focus", content)
+            self.assertIn("Founder review", content)
+            with connect_db(paths.db_path) as conn:
+                row = conn.execute(
+                    "SELECT kind, source_system, summary FROM source_documents WHERE kind = ?",
+                    (WEEKLY_CEO_BRIEF_KIND,),
+                ).fetchone()
+                weekly_brief = conn.execute(
+                    "SELECT content FROM awareness_briefs WHERE scope_kind = 'global' AND brief_type = 'weekly_ceo'"
+                ).fetchone()
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual(row["kind"], WEEKLY_CEO_BRIEF_KIND)
+            self.assertEqual(row["source_system"], "athena")
+            self.assertIn("Protect founder focus", row["summary"])
+            self.assertIsNotNone(weekly_brief)
 
 
 if __name__ == "__main__":

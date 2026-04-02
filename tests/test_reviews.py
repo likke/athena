@@ -16,6 +16,7 @@ class ReviewCycleTests(unittest.TestCase):
         "ATHENA_WORKSPACE_ROOT",
         "ATHENA_WORKSPACE_TELEGRAM_ROOT",
         "ATHENA_TASK_VIEW_DIR",
+        "ATHENA_BRIEFS_DIR",
         "ATHENA_LIFE_DIR",
         "ATHENA_LEDGER_PATH",
         "ATHENA_LOCAL_LEDGER_PATH",
@@ -27,9 +28,10 @@ class ReviewCycleTests(unittest.TestCase):
         workspace = root / "workspace"
         workspace_telegram = root / "workspace-telegram"
         task_dir = workspace_telegram / "task-system"
+        briefs_dir = workspace / "system" / "briefs"
         life_dir = workspace / "life"
         ledger = workspace / "system" / "task-ledger" / "telegram-1937792843.md"
-        for path in [workspace, workspace_telegram, task_dir, life_dir, ledger.parent]:
+        for path in [workspace, workspace_telegram, task_dir, briefs_dir, life_dir, ledger.parent]:
             path.mkdir(parents=True, exist_ok=True)
 
         self.db_path = ledger.parent / "tasks.sqlite"
@@ -39,6 +41,7 @@ class ReviewCycleTests(unittest.TestCase):
             "ATHENA_WORKSPACE_ROOT": str(workspace),
             "ATHENA_WORKSPACE_TELEGRAM_ROOT": str(workspace_telegram),
             "ATHENA_TASK_VIEW_DIR": str(task_dir),
+            "ATHENA_BRIEFS_DIR": str(briefs_dir),
             "ATHENA_LIFE_DIR": str(life_dir),
             "ATHENA_LEDGER_PATH": str(ledger),
             "ATHENA_LOCAL_LEDGER_PATH": str(task_dir / "TELEGRAM_LEDGER.md"),
@@ -199,11 +202,15 @@ class ReviewCycleTests(unittest.TestCase):
 
         self.assertGreaterEqual(weekly["findings_count"], 1)
         self.assertGreaterEqual(monthly["findings_count"], 1)
+        self.assertTrue(str(weekly.get("weekly_brief_path") or "").endswith(".md"))
+        self.assertTrue(Path(str(weekly["weekly_brief_path"])).exists())
         with connect_db(self.db_path) as conn:
             weekly_runs = query_one(conn, "SELECT COUNT(*) AS count FROM review_runs WHERE cadence = 'weekly'")
             monthly_runs = query_one(conn, "SELECT COUNT(*) AS count FROM review_runs WHERE cadence = 'monthly'")
+            brief_doc = query_one(conn, "SELECT id FROM source_documents WHERE kind = 'weekly_ceo_brief'")
         self.assertIsNotNone(weekly_runs)
         self.assertIsNotNone(monthly_runs)
+        self.assertIsNotNone(brief_doc)
         assert weekly_runs is not None
         assert monthly_runs is not None
         self.assertEqual(int(weekly_runs["count"]), 1)

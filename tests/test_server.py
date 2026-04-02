@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 import urllib.parse
+import urllib.error
 import urllib.request
 import types
 import sys
@@ -21,6 +22,7 @@ class AthenaServerTest(unittest.TestCase):
         "ATHENA_WORKSPACE_ROOT",
         "ATHENA_WORKSPACE_TELEGRAM_ROOT",
         "ATHENA_TASK_VIEW_DIR",
+        "ATHENA_BRIEFS_DIR",
         "ATHENA_LIFE_DIR",
         "ATHENA_LEDGER_PATH",
         "ATHENA_LOCAL_LEDGER_PATH",
@@ -32,8 +34,9 @@ class AthenaServerTest(unittest.TestCase):
         workspace_telegram = Path(self.tmpdir.name) / "workspace-telegram"
         ledger = workspace / "system" / "task-ledger" / "telegram-1937792843.md"
         task_view = workspace_telegram / "task-system"
+        briefs_dir = workspace / "system" / "briefs"
         life_dir = workspace / "life"
-        for path in (workspace, workspace_telegram, ledger.parent, task_view, life_dir):
+        for path in (workspace, workspace_telegram, ledger.parent, task_view, briefs_dir, life_dir):
             path.mkdir(parents=True, exist_ok=True)
         db_path = ledger.parent / "tasks.sqlite"
         env_values = {
@@ -41,6 +44,7 @@ class AthenaServerTest(unittest.TestCase):
             "ATHENA_WORKSPACE_ROOT": str(workspace),
             "ATHENA_WORKSPACE_TELEGRAM_ROOT": str(workspace_telegram),
             "ATHENA_TASK_VIEW_DIR": str(task_view),
+            "ATHENA_BRIEFS_DIR": str(briefs_dir),
             "ATHENA_LIFE_DIR": str(life_dir),
             "ATHENA_LEDGER_PATH": str(ledger),
             "ATHENA_LOCAL_LEDGER_PATH": str(task_view / "TELEGRAM_LEDGER.md"),
@@ -100,6 +104,24 @@ class AthenaServerTest(unittest.TestCase):
 
     def _insert_sample(self, db_path: Path) -> None:
         now = int(time.time())
+        brief_path = self.paths.briefs_dir / "weekly-ceo-brief-2026-03-31.md"
+        brief_path.parent.mkdir(parents=True, exist_ok=True)
+        brief_path.write_text(
+            "\n".join(
+                [
+                    "# Athena CEO Weekly Brief",
+                    "",
+                    "- week_of: 2026-03-30",
+                    "- generated_at: 2026-04-02 09:00 PHT",
+                    "",
+                    "## Executive summary",
+                    "",
+                    "- Protect founder focus this week.",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         with db_module.connect_db(db_path) as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO life_areas (id, slug, name, status, priority, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -124,6 +146,25 @@ class AthenaServerTest(unittest.TestCase):
             conn.execute(
                 "INSERT OR IGNORE INTO source_documents (id, kind, title, source_system, is_authoritative, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 ("source-1", "life", "NotebookLM Goals", "notebooklm", 0, now, now),
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO source_documents (
+                  id, kind, title, path, source_system, is_authoritative, last_synced_at, summary, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "brief-1",
+                    "weekly_ceo_brief",
+                    "Athena CEO Weekly Brief - Week of 2026-03-30",
+                    str(brief_path.resolve()),
+                    "athena",
+                    0,
+                    now,
+                    "Protect founder focus this week.",
+                    now,
+                    now,
+                ),
             )
             conn.execute(
                 "INSERT OR IGNORE INTO awareness_briefs (scope_kind, scope_id, brief_type, content, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -172,6 +213,19 @@ class AthenaServerTest(unittest.TestCase):
         with urllib.request.urlopen(request) as response:
             return json.loads(response.read().decode("utf-8"))
 
+    def _post_form_no_redirect(self, url: str, data: dict[str, object]):
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        encoded = urllib.parse.urlencode(data, doseq=True).encode("utf-8")
+        request = urllib.request.Request(url, data=encoded, method="POST")
+        opener = urllib.request.build_opener(_NoRedirect)
+        try:
+            return opener.open(request)
+        except urllib.error.HTTPError as exc:
+            return exc
+
     def test_gather_data_includes_sections(self):
         data = self.server_module._gather_data(self.paths)
         self.assertIn("dashboard", data)
@@ -179,15 +233,51 @@ class AthenaServerTest(unittest.TestCase):
         self.assertTrue(data["life"]["areas"])
         self.assertTrue(data["projects"])
         self.assertTrue(data["briefs"])
+        self.assertTrue(data["weekly_briefs"]["items"])
 
     def test_render_html_contains_sections(self):
         data = self.server_module._gather_data(self.paths)
         html_blob = self.server_module._render_html(data)
-        self.assertIn("Life context", html_blob)
+        self.assertIn("Mission control for what matters right now.", html_blob)
+        self.assertIn("Athena OS", html_blob)
+        self.assertIn('href="/board"', html_blob)
+        self.assertIn("Email approvals", html_blob)
+        self.assertIn("Portfolio health", html_blob)
+        self.assertIn("CEO weekly brief", html_blob)
+
+    def test_render_html_projects_page_contains_project_sections(self):
+        data = self.server_module._gather_data(self.paths)
+        html_blob = self.server_module._render_html(data, current_path="/projects")
         self.assertIn("DashoContent", html_blob)
-        self.assertIn("Tasks", html_blob)
-        self.assertIn("Board", html_blob)
-        self.assertIn("Quick Capture", html_blob)
+        self.assertIn("Projects", html_blob)
+        self.assertIn("Repos", html_blob)
+        self.assertIn("Brand compliance", html_blob)
+
+    def test_outbox_page_shows_configured_gmail_account(self):
+        self.paths.google_dir.mkdir(parents=True, exist_ok=True)
+        self.paths.google_settings_path.write_text(
+            json.dumps(
+                {
+                    "gmail": {
+                        "enabled": True,
+                        "default_account": "athena",
+                        "accounts": [
+                            {
+                                "label": "athena",
+                                "email": "athena@thirdteam.org",
+                                "display_name": "Athena",
+                                "default": True,
+                            }
+                        ],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        data = self.server_module._gather_data(self.paths)
+        html_blob = self.server_module._render_html(data, current_path="/outbox")
+        self.assertIn('name="account_label"', html_blob)
+        self.assertIn("athena@thirdteam.org", html_blob)
 
     def test_api_endpoints_return_expected_payloads(self):
         httpd, thread, base = self._start_server()
@@ -204,9 +294,33 @@ class AthenaServerTest(unittest.TestCase):
             outbox = json.loads(urllib.request.urlopen(f"{base}/api/outbox").read().decode("utf-8"))
             self.assertTrue(any(row["id"] == "outbox-1" for row in outbox))
 
+            weekly_briefs = json.loads(urllib.request.urlopen(f"{base}/api/weekly-briefs").read().decode("utf-8"))
+            self.assertTrue(weekly_briefs["items"])
+            self.assertEqual(weekly_briefs["items"][0]["id"], "brief-1")
+
             health = json.loads(urllib.request.urlopen(f"{base}/api/health").read().decode("utf-8"))
             self.assertTrue(health["ok"])
             self.assertTrue(str(health["db"]).endswith("tasks.sqlite"))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
+
+    def test_html_routes_render_page_specific_content(self):
+        httpd, thread, base = self._start_server()
+        try:
+            pages = {
+                "/": "Mission control for what matters right now.",
+                "/board": "Kanban lists for capture, work in progress, blockers, and done.",
+                "/inbox": "Raw captures stay here until Athena or Fleire turns them into work.",
+                "/outbox": "Batch approve, reject, and send from one place.",
+                "/projects": "The authoritative operating view for the projects Athena is tracking.",
+                "/briefs": "A weekly founder packet grounded in Athena's local life, portfolio, task, approval, and calendar state.",
+                "/context": "The rules, goals, and people Athena uses to hold the larger picture.",
+            }
+            for route, marker in pages.items():
+                body = urllib.request.urlopen(f"{base}{route}").read().decode("utf-8")
+                self.assertIn(marker, body)
         finally:
             httpd.shutdown()
             httpd.server_close()
@@ -231,6 +345,25 @@ class AthenaServerTest(unittest.TestCase):
             self.assertEqual(kwargs["summary"], "Shipped board mutation tests.")
             self.assertEqual(kwargs["evidence"], ["pytest tests/test_server.py", "board api smoke"])
             self.assertEqual(kwargs["verified_by"], "fleire")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
+
+    def test_capture_redirect_returns_to_requested_page(self):
+        httpd, thread, base = self._start_server()
+        try:
+            response = self._post_form_no_redirect(
+                f"{base}/captures/new",
+                {
+                    "raw_text": "Need a cleaner inbox",
+                    "redirect_to": "/inbox",
+                },
+            )
+            self.assertEqual(response.code, 303)
+            location = response.headers.get("Location", "")
+            self.assertTrue(location.startswith("/inbox?"), location)
+            self.assertIn("Captured+into+inbox", location)
         finally:
             httpd.shutdown()
             httpd.server_close()

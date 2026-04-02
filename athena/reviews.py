@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,7 @@ from .db import connect_db, ensure_db, now_ts, query_all, query_one
 from .render_markdown import render
 from .rollups import refresh_rollups
 from .state import capture_item
+from .synthesis import generate_weekly_ceo_brief
 
 
 def _resolve_db(db_path: Path | None = None) -> Path:
@@ -186,6 +188,9 @@ def run_review_cycle(cadence: str, db_path: Path | None = None, actor: str = "at
         raise ValueError(f"Unsupported review cadence: {cadence}")
 
     resolved_db = _resolve_db(db_path)
+    resolved_paths = default_paths()
+    if resolved_paths.db_path != resolved_db:
+        resolved_paths = replace(resolved_paths, db_path=resolved_db)
     ensure_db(resolved_db)
     refresh_rollups(resolved_db)
 
@@ -226,10 +231,18 @@ def run_review_cycle(cadence: str, db_path: Path | None = None, actor: str = "at
         )
         conn.commit()
 
+    weekly_brief: dict[str, Any] | None = None
+    if cadence == "weekly":
+        with connect_db(resolved_db) as conn:
+            weekly_brief = generate_weekly_ceo_brief(conn, paths=resolved_paths)
+            conn.commit()
+
     render(db_path=resolved_db)
     return {
         "cadence": cadence,
         "findings_count": len(findings),
         "created_items_count": created_items,
         "db": str(resolved_db),
+        "weekly_brief_path": weekly_brief["path"] if weekly_brief else None,
+        "weekly_brief_summary": weekly_brief["summary"] if weekly_brief else None,
     }

@@ -33,6 +33,7 @@ def _test_paths(tmp_dir: Path):
         "db_path": tmp_dir / "tasks.sqlite",
         "workspace_root": tmp_dir / "workspace",
         "workspace_telegram_root": tmp_dir / "workspace-telegram",
+        "briefs_dir": tmp_dir / "workspace" / "system" / "briefs",
         "life_dir": tmp_dir / "life",
         "notebooklm_export_dir": tmp_dir / "life" / "notebooklm-exports",
         "google_dir": tmp_dir / "workspace" / "system" / "google",
@@ -51,6 +52,7 @@ class FakeTransport:
     def __init__(self):
         self.json_routes: list[tuple[str, object]] = []
         self.byte_routes: list[tuple[str, bytes]] = []
+        self.requests: list[dict[str, object]] = []
 
     def add_json(self, contains: str, payload: object) -> None:
         self.json_routes.append((contains, payload))
@@ -59,6 +61,7 @@ class FakeTransport:
         self.byte_routes.append((contains, payload))
 
     def request_json(self, method: str, url: str, *, headers=None, data=None):
+        self.requests.append({"kind": "json", "method": method, "url": url, "headers": headers or {}, "data": data})
         for contains, payload in self.json_routes:
             if contains in url:
                 if isinstance(payload, Exception):
@@ -67,6 +70,7 @@ class FakeTransport:
         raise AssertionError(f"Unexpected JSON request: {method} {url}")
 
     def request_bytes(self, method: str, url: str, *, headers=None, data=None) -> bytes:
+        self.requests.append({"kind": "bytes", "method": method, "url": url, "headers": headers or {}, "data": data})
         for contains, payload in self.byte_routes:
             if contains in url:
                 if isinstance(payload, Exception):
@@ -194,6 +198,101 @@ class GoogleTestCase(unittest.TestCase):
             auth = build_auth_url(paths, scopes=("gmail",))
             params = urllib.parse.parse_qs(urllib.parse.urlparse(auth["auth_url"]).query)
             self.assertEqual(params["include_granted_scopes"], ["true"])
+
+    def test_account_specific_auth_and_draft_use_account_paths_and_sender(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            paths = _test_paths(tmp)
+            paths.google_dir.mkdir(parents=True, exist_ok=True)
+            athena_client_secret = paths.google_dir / "accounts" / "athena" / "client_secret.json"
+            athena_token_path = paths.google_dir / "accounts" / "athena" / "token.json"
+            athena_client_secret.parent.mkdir(parents=True, exist_ok=True)
+            athena_client_secret.write_text(
+                json.dumps(
+                    {
+                        "installed": {
+                            "client_id": "athena-client-id",
+                            "client_secret": "athena-client-secret",
+                            "auth_uri": "https://accounts.example.com/o/oauth2/v2/auth",
+                            "token_uri": "https://oauth2.example.com/token",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            paths.google_settings_path.write_text(
+                json.dumps(
+                    {
+                        "oauth": {
+                            "profile": "athena-google-full",
+                            "scopes": [],
+                            "include_granted_scopes": False,
+                        },
+                        "gmail": {
+                            "enabled": True,
+                            "default_account": "athena",
+                            "accounts": [
+                                {
+                                    "label": "athena",
+                                    "email": "athena@thirdteam.org",
+                                    "display_name": "Athena",
+                                    "default": True,
+                                    "token_path": "accounts/athena/token.json",
+                                    "client_secret_path": "accounts/athena/client_secret.json",
+                                }
+                            ],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            auth = build_auth_url(paths, scopes=("gmail-compose",), account_label="athena")
+            self.assertEqual(auth["account_label"], "athena")
+            self.assertEqual(auth["account_email"], "athena@thirdteam.org")
+            self.assertEqual(Path(auth["token_path"]).resolve(), athena_token_path.resolve())
+            self.assertTrue((paths.google_dir / "oauth-session.athena.json").exists())
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(auth["auth_url"]).query)
+            self.assertEqual(params["login_hint"], ["athena@thirdteam.org"])
+
+            transport = FakeTransport()
+            transport.add_json(
+                "https://oauth2.example.com/token",
+                {
+                    "access_token": "athena-access-token",
+                    "refresh_token": "athena-refresh-token",
+                    "expires_in": 3600,
+                    "scope": " ".join([GMAIL_MODIFY_SCOPE]),
+                    "token_type": "Bearer",
+                },
+            )
+            exchange = exchange_code("athena-auth-code", paths, transport=transport, account_label="athena")
+            self.assertEqual(exchange["account_label"], "athena")
+            self.assertTrue(athena_token_path.exists())
+
+            transport.add_json(
+                "gmail.googleapis.com/gmail/v1/users/me/drafts",
+                {
+                    "id": "athena-draft-1",
+                    "message": {"id": "athena-msg-1", "threadId": "athena-thread-1"},
+                },
+            )
+            draft = create_gmail_draft(
+                paths=paths,
+                to_recipients="client@example.com",
+                subject="Athena note",
+                body_text="Draft body",
+                account_label="athena",
+                transport=transport,
+            )
+            self.assertEqual(draft["account_label"], "athena")
+            draft_requests = [request for request in transport.requests if "gmail.googleapis.com/gmail/v1/users/me/drafts" in str(request["url"])]
+            self.assertTrue(draft_requests)
+            payload = json.loads(bytes(draft_requests[-1]["data"]).decode("utf-8"))
+            raw_message = payload["message"]["raw"]
+            padded = raw_message + "=" * ((4 - len(raw_message) % 4) % 4)
+            decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+            self.assertIn("From: Athena <athena@thirdteam.org>", decoded)
 
     def test_mirror_google_sources_syncs_gmail_drive_and_notebooklm(self):
         with tempfile.TemporaryDirectory() as tmpdir:

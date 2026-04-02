@@ -235,6 +235,7 @@ def parse_args() -> argparse.Namespace:
     outbox_parser.add_argument("--body", required=True)
     outbox_parser.add_argument("--task-id", default=None)
     outbox_parser.add_argument("--project-id", default=None)
+    outbox_parser.add_argument("--account", dest="account_label", default=None)
     outbox_parser.add_argument("--actor", default="athena")
 
     approve_outbox_parser = subparsers.add_parser("approve-outbox", parents=[common], help="Approve one or more outbox items.")
@@ -265,6 +266,188 @@ def fetch_chat_state(conn, channel: str, chat_id: str) -> dict[str, Any] | None:
             (channel, chat_id),
         ).fetchone()
     )
+
+
+def _latest_weekly_brief(conn) -> dict[str, Any] | None:
+    return row_to_dict(
+        conn.execute(
+            """
+            SELECT title, path, summary, last_synced_at
+            FROM source_documents
+            WHERE kind = 'weekly_ceo_brief'
+            ORDER BY COALESCE(last_synced_at, updated_at) DESC, updated_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    )
+
+
+def _life_focus(conn) -> list[dict[str, Any]]:
+    return [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT
+              g.id,
+              g.title,
+              g.current_focus,
+              g.supporting_rule,
+              g.risk_if_ignored,
+              g.status_note,
+              g.derived_summary,
+              g.last_reviewed_at,
+              la.name AS area_name,
+              la.priority AS area_priority
+            FROM life_goals g
+            JOIN life_areas la ON la.id = g.life_area_id
+            WHERE g.status = 'active'
+            ORDER BY la.priority DESC, g.updated_at DESC
+            LIMIT 4
+            """
+        ).fetchall()
+    ]
+
+
+def _portfolio_focus(conn) -> list[dict[str, Any]]:
+    return [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT
+              p.id,
+              p.name,
+              p.status,
+              p.health,
+              p.current_goal,
+              p.next_milestone,
+              p.blocker,
+              p.rollup_summary,
+              p.last_real_progress_at,
+              pf.name AS portfolio_name,
+              pf.priority AS portfolio_priority
+            FROM projects p
+            JOIN portfolios pf ON pf.id = p.portfolio_id
+            WHERE p.status IN ('active', 'blocked')
+            ORDER BY
+              pf.priority DESC,
+              CASE p.status WHEN 'blocked' THEN 0 ELSE 1 END,
+              CASE p.health WHEN 'red' THEN 0 WHEN 'yellow' THEN 1 ELSE 2 END,
+              p.updated_at DESC
+            LIMIT 6
+            """
+        ).fetchall()
+    ]
+
+
+def _calendar_agenda(conn) -> dict[str, Any] | None:
+    agenda = row_to_dict(
+        conn.execute(
+            """
+            SELECT title, path, summary, last_synced_at
+            FROM source_documents
+            WHERE kind = 'calendar_agenda'
+            ORDER BY COALESCE(last_synced_at, updated_at) DESC, updated_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    )
+    if not agenda:
+        return None
+
+    lines: list[str] = []
+    if agenda.get("path"):
+        path = Path(str(agenda["path"])).expanduser().resolve()
+        if path.exists():
+            lines = [
+                line.strip()
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip().startswith("- ")
+            ][:6]
+    agenda["lines"] = lines
+    return agenda
+
+
+def _recent_context_docs(conn) -> list[dict[str, Any]]:
+    return [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT title, source_system, kind, summary, path, last_synced_at
+            FROM source_documents
+            WHERE kind IN (
+              'external_context',
+              'gmail_mailbox',
+              'drive_file_summary',
+              'notebooklm_export_summary',
+              'notebooklm'
+            )
+            ORDER BY COALESCE(last_synced_at, updated_at) DESC, updated_at DESC
+            LIMIT 6
+            """
+        ).fetchall()
+    ]
+
+
+def _status_counts(conn) -> dict[str, int]:
+    task_counts = row_to_dict(
+        conn.execute(
+            """
+            SELECT
+              COALESCE(SUM(CASE WHEN status IN ('queued', 'in_progress', 'blocked', 'someday') THEN 1 ELSE 0 END), 0) AS open_tasks,
+              COALESCE(SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END), 0) AS blocked_tasks,
+              COALESCE(SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END), 0) AS in_progress_tasks
+            FROM tasks
+            """
+        ).fetchone()
+    ) or {}
+    approval_counts = row_to_dict(
+        conn.execute(
+            """
+            SELECT
+              COALESCE(SUM(CASE WHEN status = 'needs_approval' THEN 1 ELSE 0 END), 0) AS approvals_waiting,
+              COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0) AS approvals_ready
+            FROM outbox_items
+            """
+        ).fetchone()
+    ) or {}
+    return {
+        "open_tasks": int(task_counts.get("open_tasks") or 0),
+        "blocked_tasks": int(task_counts.get("blocked_tasks") or 0),
+        "in_progress_tasks": int(task_counts.get("in_progress_tasks") or 0),
+        "approvals_waiting": int(approval_counts.get("approvals_waiting") or 0),
+        "approvals_ready": int(approval_counts.get("approvals_ready") or 0),
+    }
+
+
+def _sentence(text: str | None) -> str:
+    clean = str(text or "").strip().rstrip(".!?")
+    return f"{clean}." if clean else ""
+
+
+def _founder_summary(
+    *,
+    weekly_brief: dict[str, Any] | None,
+    life_focus: list[dict[str, Any]],
+    portfolio_focus: list[dict[str, Any]],
+    counts: dict[str, int],
+) -> str:
+    if weekly_brief and weekly_brief.get("summary"):
+        return str(weekly_brief["summary"]).strip()
+
+    parts: list[str] = []
+    if life_focus:
+        goal = life_focus[0]
+        focus = _sentence(goal.get("current_focus") or goal.get("supporting_rule") or goal.get("derived_summary"))
+        parts.append(f"Life focus: {goal['title']}. {focus}".strip())
+    if portfolio_focus:
+        project = portfolio_focus[0]
+        next_step = _sentence(project.get("next_milestone") or project.get("current_goal") or project.get("rollup_summary"))
+        parts.append(f"Project focus: {project['portfolio_name']} / {project['name']}. {next_step}".strip())
+    if counts.get("approvals_waiting"):
+        parts.append(f"Approval queue: {counts['approvals_waiting']} waiting.")
+    elif counts.get("blocked_tasks"):
+        parts.append(f"Blocked work: {counts['blocked_tasks']} blocked task(s).")
+    return " | ".join(part for part in parts if part).strip()
 
 
 def merge_task(existing: dict[str, Any] | None, payload: dict[str, Any]) -> dict[str, Any]:
@@ -470,6 +653,8 @@ def current_state(db_path: Path, channel: str, chat_id: str) -> dict[str, Any]:
                   c.channel,
                   c.chat_id,
                   c.current_capture_id,
+                  c.active_life_area_id,
+                  c.active_life_goal_id,
                   c.current_task_id,
                   c.current_project_id,
                   c.current_portfolio_id,
@@ -483,12 +668,16 @@ def current_state(db_path: Path, channel: str, chat_id: str) -> dict[str, Any]:
                   t.status AS current_task_status,
                   t.next_action AS current_task_next_action,
                   pt.title AS pending_approval_title,
+                  la.name AS active_life_area_name,
+                  lg.title AS active_life_goal_title,
                   p.name AS current_project_name,
                   pf.name AS current_portfolio_name
                 FROM chat_state c
                 LEFT JOIN captured_items ci ON ci.id = c.current_capture_id
                 LEFT JOIN tasks t ON t.id = c.current_task_id
                 LEFT JOIN tasks pt ON pt.id = c.pending_approval_task_id
+                LEFT JOIN life_areas la ON la.id = c.active_life_area_id
+                LEFT JOIN life_goals lg ON lg.id = c.active_life_goal_id
                 LEFT JOIN projects p ON p.id = c.current_project_id
                 LEFT JOIN portfolios pf ON pf.id = c.current_portfolio_id
                 WHERE c.channel = ? AND c.chat_id = ?
@@ -571,9 +760,30 @@ def current_state(db_path: Path, channel: str, chat_id: str) -> dict[str, Any]:
                 (channel, chat_id),
             ).fetchall()
         ]
+        weekly_brief = _latest_weekly_brief(conn)
+        life_focus = _life_focus(conn)
+        portfolio_focus = _portfolio_focus(conn)
+        calendar_agenda = _calendar_agenda(conn)
+        recent_context = _recent_context_docs(conn)
+        status_counts = _status_counts(conn)
+        founder_summary = _founder_summary(
+            weekly_brief=weekly_brief,
+            life_focus=life_focus,
+            portfolio_focus=portfolio_focus,
+            counts=status_counts,
+        )
     return {
         "channel": channel,
         "chat_id": chat_id,
+        "founder_context": {
+            "summary": founder_summary,
+            "status_counts": status_counts,
+            "weekly_brief": weekly_brief,
+            "life_focus": life_focus,
+            "portfolio_focus": portfolio_focus,
+            "calendar_agenda": calendar_agenda,
+            "recent_context": recent_context,
+        },
         "current": current,
         "open_tasks": open_tasks,
         "inbox_items": inbox_items,
@@ -755,6 +965,7 @@ def main() -> int:
                 body_text=args.body,
                 task_id=args.task_id,
                 project_id=args.project_id,
+                account_label=args.account_label,
                 actor=args.actor,
             )
         elif args.command == "approve-outbox":

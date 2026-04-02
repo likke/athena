@@ -7,7 +7,7 @@ from typing import Any, Iterable
 
 from .config import AthenaPaths, default_paths
 from .db import connect_db, ensure_db, now_ts, query_all, query_one, slugify
-from .google import create_gmail_draft, send_gmail_draft
+from .google import create_gmail_draft, resolve_gmail_account, send_gmail_draft
 
 OUTBOX_OPEN_STATUSES = ("drafting", "needs_approval", "approved", "sending", "error")
 
@@ -122,12 +122,16 @@ def create_email_outbox(
     project_id: str | None = None,
     cc_recipients: str | Iterable[str] | None = None,
     bcc_recipients: str | Iterable[str] | None = None,
-    account_label: str = "primary",
+    account_label: str | None = None,
     actor: str = "athena",
     transport: Any | None = None,
 ) -> dict[str, Any]:
     resolved_db = _resolve_db(db_path)
     resolved_paths = paths or default_paths()
+    resolved_account = resolve_gmail_account(
+        resolved_paths,
+        account_label=account_label,
+    )
     ensure_db(resolved_db)
     normalized_to = _normalize_recipients(to_recipients)
     normalized_cc = _normalize_recipients(cc_recipients)
@@ -156,7 +160,7 @@ def create_email_outbox(
                 task_id,
                 project_id,
                 "gmail",
-                account_label,
+                resolved_account.label,
                 normalized_to,
                 normalized_cc or None,
                 normalized_bcc or None,
@@ -187,6 +191,7 @@ def create_email_outbox(
             cc_recipients=normalized_cc or None,
             bcc_recipients=normalized_bcc or None,
             transport=transport,
+            account_label=resolved_account.label,
         )
     except Exception as exc:
         with connect_db(resolved_db) as conn:
@@ -359,6 +364,7 @@ def send_outbox_items(
             continue
 
         draft_id = str(row.get("draft_id") or "").strip()
+        account_label = str(row.get("account_label") or "").strip() or None
         try:
             if not draft_id:
                 draft = create_gmail_draft(
@@ -369,6 +375,7 @@ def send_outbox_items(
                     cc_recipients=str(row.get("cc_recipients") or ""),
                     bcc_recipients=str(row.get("bcc_recipients") or ""),
                     transport=transport,
+                    account_label=account_label,
                 )
                 draft_id = str(draft.get("draft_id") or "").strip()
                 with connect_db(resolved_db) as conn:
@@ -411,6 +418,7 @@ def send_outbox_items(
                 paths=resolved_paths,
                 draft_id=draft_id,
                 transport=transport,
+                account_label=account_label,
             )
             with connect_db(resolved_db) as conn:
                 now = now_ts()

@@ -6,12 +6,17 @@ import hashlib
 import json
 import re
 import secrets
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+import webbrowser
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from email.utils import formataddr
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -97,6 +102,18 @@ class GmailMirrorSettings:
     enabled: bool = False
     query: str = "in:inbox newer_than:30d"
     max_results: int = 15
+    default_account_label: str = "primary"
+    accounts: tuple["GmailAccountSettings", ...] = ()
+
+
+@dataclass(frozen=True)
+class GmailAccountSettings:
+    label: str = "primary"
+    email: str = ""
+    display_name: str = ""
+    is_default: bool = False
+    token_path: Path | None = None
+    client_secrets_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +184,23 @@ def _ensure_dir(path: Path) -> Path:
 
 def _oauth_session_path(paths: AthenaPaths) -> Path:
     return paths.google_dir / "oauth-session.json"
+
+
+def _oauth_session_path_for_account(paths: AthenaPaths, account_label: str | None = None) -> Path:
+    clean = re.sub(r"[^A-Za-z0-9._-]+", "-", str(account_label or "").strip().lower()).strip("-")
+    if not clean or clean == "primary":
+        return _oauth_session_path(paths)
+    return paths.google_dir / f"oauth-session.{clean}.json"
+
+
+def _resolve_config_path(root: Path, raw_value: Any) -> Path | None:
+    clean = str(raw_value or "").strip()
+    if not clean:
+        return None
+    candidate = Path(clean).expanduser()
+    if not candidate.is_absolute():
+        candidate = (root / candidate).expanduser()
+    return candidate.resolve()
 
 
 def _load_client_config(paths: AthenaPaths) -> dict[str, Any]:
@@ -241,6 +275,15 @@ def init_settings_template(paths: AthenaPaths | None = None, *, force: bool = Fa
             "enabled": True,
             "query": "in:inbox category:primary newer_than:30d",
             "max_results": 15,
+            "default_account": "athena",
+            "accounts": [
+                {
+                    "label": "athena",
+                    "email": "athena@thirdteam.org",
+                    "display_name": "Athena",
+                    "default": True,
+                }
+            ],
         },
         "calendar": {
             "enabled": True,
@@ -294,10 +337,33 @@ def load_sync_settings(paths: AthenaPaths | None = None) -> GoogleSyncSettings:
     oauth_scopes = tuple(str(item).strip() for item in (oauth.get("scopes") or []) if str(item).strip())
     include_granted_scopes = bool(oauth.get("include_granted_scopes", False))
     gmail = raw.get("gmail") or {}
+    gmail_accounts: list[GmailAccountSettings] = []
+    for account in gmail.get("accounts") or []:
+        label = str(account.get("label") or "").strip()
+        if not label:
+            continue
+        gmail_accounts.append(
+            GmailAccountSettings(
+                label=label,
+                email=str(account.get("email") or "").strip(),
+                display_name=str(account.get("display_name") or account.get("name") or "").strip(),
+                is_default=bool(account.get("default", False)),
+                token_path=_resolve_config_path(resolved_paths.google_dir, account.get("token_path")),
+                client_secrets_path=_resolve_config_path(resolved_paths.google_dir, account.get("client_secret_path")),
+            )
+        )
+    default_account_label = str(
+        gmail.get("default_account")
+        or gmail.get("default_account_label")
+        or next((account.label for account in gmail_accounts if account.is_default), "")
+        or (gmail_accounts[0].label if gmail_accounts else GmailMirrorSettings.default_account_label)
+    ).strip()
     gmail_settings = GmailMirrorSettings(
         enabled=bool(gmail.get("enabled", False)),
         query=str(gmail.get("query") or GmailMirrorSettings.query),
         max_results=int(gmail.get("max_results") or GmailMirrorSettings.max_results),
+        default_account_label=default_account_label or GmailMirrorSettings.default_account_label,
+        accounts=tuple(gmail_accounts),
     )
     calendar = raw.get("calendar") or {}
     calendar_ids = tuple(str(item).strip() for item in (calendar.get("calendar_ids") or ["primary"]) if str(item).strip())
@@ -347,6 +413,86 @@ def load_sync_settings(paths: AthenaPaths | None = None) -> GoogleSyncSettings:
     )
 
 
+def _fallback_gmail_account() -> GmailAccountSettings:
+    return GmailAccountSettings(
+        label="primary",
+        email="",
+        display_name="Primary Gmail",
+        is_default=True,
+    )
+
+
+def resolve_gmail_account(
+    paths: AthenaPaths | None = None,
+    *,
+    account_label: str | None = None,
+) -> GmailAccountSettings:
+    resolved_paths = paths or default_paths()
+    settings = load_sync_settings(resolved_paths)
+    accounts = list(settings.gmail.accounts)
+    if not accounts:
+        fallback = _fallback_gmail_account()
+        requested = str(account_label or "").strip()
+        if requested and requested not in {"primary", fallback.label}:
+            raise GoogleAuthError(f"Unknown Gmail account label: {requested}")
+        return fallback
+
+    requested_label = str(account_label or settings.gmail.default_account_label or "").strip()
+    if requested_label:
+        for account in accounts:
+            if account.label == requested_label:
+                return account
+        raise GoogleAuthError(f"Unknown Gmail account label: {requested_label}")
+    for account in accounts:
+        if account.is_default:
+            return account
+    return accounts[0]
+
+
+def _paths_for_gmail_account(paths: AthenaPaths, account: GmailAccountSettings) -> AthenaPaths:
+    token_path = account.token_path or paths.google_token_path
+    client_secrets_path = account.client_secrets_path or paths.google_client_secrets_path
+    return replace(
+        paths,
+        google_token_path=token_path.expanduser().resolve(),
+        google_client_secrets_path=client_secrets_path.expanduser().resolve(),
+    )
+
+
+def list_gmail_accounts(paths: AthenaPaths | None = None) -> list[dict[str, Any]]:
+    resolved_paths = paths or default_paths()
+    settings = load_sync_settings(resolved_paths)
+    if not settings.gmail.accounts:
+        fallback = _fallback_gmail_account()
+        fallback_paths = _paths_for_gmail_account(resolved_paths, fallback)
+        return [
+            {
+                "label": fallback.label,
+                "email": fallback.email,
+                "display_name": fallback.display_name,
+                "is_default": True,
+                "token_path": str(fallback_paths.google_token_path),
+                "client_secret_path": str(fallback_paths.google_client_secrets_path),
+            }
+        ]
+
+    default_account = resolve_gmail_account(resolved_paths)
+    rows: list[dict[str, Any]] = []
+    for account in settings.gmail.accounts:
+        account_paths = _paths_for_gmail_account(resolved_paths, account)
+        rows.append(
+            {
+                "label": account.label,
+                "email": account.email,
+                "display_name": account.display_name or account.label,
+                "is_default": account.label == default_account.label,
+                "token_path": str(account_paths.google_token_path),
+                "client_secret_path": str(account_paths.google_client_secrets_path),
+            }
+        )
+    return rows
+
+
 def requested_scopes(paths: AthenaPaths | None = None, scopes: Iterable[str] | None = None) -> list[str]:
     resolved_paths = paths or default_paths()
     explicit = list(scopes or [])
@@ -362,9 +508,12 @@ def build_auth_url(
     *,
     scopes: Iterable[str] | None = None,
     redirect_uri: str = DEFAULT_REDIRECT_URI,
+    account_label: str | None = None,
 ) -> dict[str, Any]:
     resolved_paths = paths or default_paths()
-    client = _load_client_config(resolved_paths)
+    account = resolve_gmail_account(resolved_paths, account_label=account_label)
+    account_paths = _paths_for_gmail_account(resolved_paths, account)
+    client = _load_client_config(account_paths)
     normalized_scopes = requested_scopes(resolved_paths, scopes)
     settings = load_sync_settings(resolved_paths)
     session = {
@@ -385,14 +534,20 @@ def build_auth_url(
         "code_challenge": _code_challenge(session["code_verifier"]),
         "code_challenge_method": "S256",
     }
+    if account.email:
+        params["login_hint"] = account.email
     auth_url = f"{client['auth_uri']}?{urllib.parse.urlencode(params)}"
     session["auth_url"] = auth_url
-    session_path = _oauth_session_path(resolved_paths)
+    session_path = _oauth_session_path_for_account(resolved_paths, account.label)
     _ensure_dir(resolved_paths.google_dir)
     _write_json(session_path, session)
     return {
         "auth_url": auth_url,
+        "account_label": account.label,
+        "account_email": account.email,
         "session_path": str(session_path),
+        "client_secret_path": str(account_paths.google_client_secrets_path),
+        "token_path": str(account_paths.google_token_path),
         "redirect_uri": redirect_uri,
         "scopes": normalized_scopes,
     }
@@ -403,10 +558,13 @@ def exchange_code(
     paths: AthenaPaths | None = None,
     *,
     transport: UrlLibTransport | None = None,
+    account_label: str | None = None,
 ) -> dict[str, Any]:
     resolved_paths = paths or default_paths()
-    client = _load_client_config(resolved_paths)
-    session_path = _oauth_session_path(resolved_paths)
+    account = resolve_gmail_account(resolved_paths, account_label=account_label)
+    account_paths = _paths_for_gmail_account(resolved_paths, account)
+    client = _load_client_config(account_paths)
+    session_path = _oauth_session_path_for_account(resolved_paths, account.label)
     if not session_path.exists():
         raise GoogleAuthError(f"Missing OAuth session file: {session_path}")
     session = json.loads(session_path.read_text(encoding="utf-8"))
@@ -429,11 +587,113 @@ def exchange_code(
     )
     token["expiry"] = _expiry_from_token_response(token)
     token["scope"] = token.get("scope") or " ".join(session.get("scopes") or [])
-    _write_json(resolved_paths.google_token_path, token)
+    _write_json(account_paths.google_token_path, token)
     return {
-        "token_path": str(resolved_paths.google_token_path),
+        "account_label": account.label,
+        "account_email": account.email,
+        "token_path": str(account_paths.google_token_path),
         "scopes": token["scope"],
         "has_refresh_token": bool(token.get("refresh_token")),
+    }
+
+
+def authorize_with_local_browser(
+    paths: AthenaPaths | None = None,
+    *,
+    scopes: Iterable[str] | None = None,
+    account_label: str | None = None,
+    redirect_uri: str = DEFAULT_REDIRECT_URI,
+    open_browser: bool = True,
+    timeout_seconds: int = 240,
+    transport: UrlLibTransport | None = None,
+) -> dict[str, Any]:
+    resolved_paths = paths or default_paths()
+    auth = build_auth_url(
+        resolved_paths,
+        scopes=scopes,
+        redirect_uri=redirect_uri,
+        account_label=account_label,
+    )
+    callback_url = urllib.parse.urlsplit(redirect_uri)
+    callback_host = callback_url.hostname or "127.0.0.1"
+    callback_port = callback_url.port
+    callback_path = callback_url.path or "/"
+    if callback_port is None:
+        raise GoogleAuthError("Redirect URI must include an explicit localhost port for local browser auth.")
+    if callback_host not in {"127.0.0.1", "localhost"}:
+        raise GoogleAuthError("Local browser auth only supports localhost redirect URIs.")
+
+    session_path = Path(auth["session_path"]).expanduser().resolve()
+    session_payload = json.loads(session_path.read_text(encoding="utf-8"))
+    expected_state = str(session_payload.get("state") or "")
+    result: dict[str, str] = {}
+    event = threading.Event()
+
+    class OAuthCallbackHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:  # pragma: no cover - keep console clean
+            return
+
+        def do_GET(self) -> None:  # noqa: N802
+            parsed = urllib.parse.urlsplit(self.path)
+            if parsed.path != callback_path:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            result["code"] = (params.get("code") or [""])[-1]
+            result["state"] = (params.get("state") or [""])[-1]
+            result["error"] = (params.get("error") or [""])[-1]
+            result["error_description"] = (params.get("error_description") or [""])[-1]
+            if result["error"]:
+                body = "<h1>Google auth failed</h1><p>You can return to Athena and try again.</p>"
+            else:
+                body = "<h1>Athena Google auth complete</h1><p>You can close this tab and return to Athena.</p>"
+            encoded = body.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+            event.set()
+
+    try:
+        httpd = HTTPServer((callback_host, callback_port), OAuthCallbackHandler)
+    except OSError as exc:
+        raise GoogleAuthError(f"Could not bind OAuth callback server on {callback_host}:{callback_port}: {exc}") from exc
+
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        if open_browser:
+            webbrowser.open(auth["auth_url"], new=1, autoraise=True)
+        if not event.wait(timeout_seconds):
+            raise GoogleAuthError(
+                f"Timed out waiting for Google auth callback on {callback_host}:{callback_port}."
+            )
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
+
+    if result.get("error"):
+        detail = result.get("error_description") or result["error"]
+        raise GoogleAuthError(f"Google auth was not completed: {detail}")
+    if result.get("state") != expected_state:
+        raise GoogleAuthError("OAuth callback state did not match the stored session.")
+    code = str(result.get("code") or "").strip()
+    if not code:
+        raise GoogleAuthError("OAuth callback did not include an authorization code.")
+
+    exchange = exchange_code(
+        code,
+        resolved_paths,
+        transport=transport,
+        account_label=auth["account_label"],
+    )
+    return {
+        **auth,
+        **exchange,
+        "opened_browser": open_browser,
+        "timeout_seconds": timeout_seconds,
     }
 
 
@@ -441,9 +701,12 @@ def ensure_access_token(
     paths: AthenaPaths | None = None,
     *,
     transport: UrlLibTransport | None = None,
+    account_label: str | None = None,
 ) -> str:
     resolved_paths = paths or default_paths()
-    token_data = _load_token_data(resolved_paths)
+    account = resolve_gmail_account(resolved_paths, account_label=account_label)
+    account_paths = _paths_for_gmail_account(resolved_paths, account)
+    token_data = _load_token_data(account_paths)
     expiry = int(token_data.get("expiry") or 0)
     now_ts = int(datetime.now(tz=timezone.utc).timestamp())
     access_token = str(token_data.get("access_token") or "")
@@ -454,7 +717,7 @@ def ensure_access_token(
     if not refresh_token:
         raise GoogleAuthError("Google token file has no refresh_token; re-run the OAuth flow.")
 
-    client = _load_client_config(resolved_paths)
+    client = _load_client_config(account_paths)
     transport = transport or UrlLibTransport()
     payload = urllib.parse.urlencode(
         {
@@ -473,26 +736,31 @@ def ensure_access_token(
     token_data.update(refreshed)
     token_data["refresh_token"] = refresh_token
     token_data["expiry"] = _expiry_from_token_response(refreshed)
-    _write_json(resolved_paths.google_token_path, token_data)
+    _write_json(account_paths.google_token_path, token_data)
     return str(token_data["access_token"])
 
 
-def oauth_status(paths: AthenaPaths | None = None) -> dict[str, Any]:
+def oauth_status(paths: AthenaPaths | None = None, *, account_label: str | None = None) -> dict[str, Any]:
     resolved_paths = paths or default_paths()
     settings = load_sync_settings(resolved_paths)
+    account = resolve_gmail_account(resolved_paths, account_label=account_label)
+    account_paths = _paths_for_gmail_account(resolved_paths, account)
     status = {
         "google_dir": str(resolved_paths.google_dir),
         "settings_path": str(resolved_paths.google_settings_path),
-        "client_secret_path": str(resolved_paths.google_client_secrets_path),
-        "client_secret_present": resolved_paths.google_client_secrets_path.exists(),
-        "token_path": str(resolved_paths.google_token_path),
-        "token_present": resolved_paths.google_token_path.exists(),
+        "account_label": account.label,
+        "account_email": account.email,
+        "configured_accounts": list_gmail_accounts(resolved_paths),
+        "client_secret_path": str(account_paths.google_client_secrets_path),
+        "client_secret_present": account_paths.google_client_secrets_path.exists(),
+        "token_path": str(account_paths.google_token_path),
+        "token_present": account_paths.google_token_path.exists(),
         "requested_scopes": requested_scopes(resolved_paths),
         "oauth_profile": settings.oauth_profile,
         "include_granted_scopes": settings.include_granted_scopes,
     }
-    if resolved_paths.google_token_path.exists():
-        token = _load_token_data(resolved_paths)
+    if account_paths.google_token_path.exists():
+        token = _load_token_data(account_paths)
         status["granted_scopes"] = str(token.get("scope") or "").split()
         status["has_refresh_token"] = bool(token.get("refresh_token"))
         status["token_expiry"] = token.get("expiry")
@@ -558,8 +826,12 @@ def _gmail_raw_message(
     body_text: str,
     cc_recipients: str | None = None,
     bcc_recipients: str | None = None,
+    from_address: str | None = None,
+    from_name: str | None = None,
 ) -> str:
     message = EmailMessage()
+    if from_address:
+        message["From"] = formataddr((from_name or "", from_address))
     message["To"] = to_recipients
     if cc_recipients:
         message["Cc"] = cc_recipients
@@ -580,10 +852,12 @@ def create_gmail_draft(
     cc_recipients: str | None = None,
     bcc_recipients: str | None = None,
     transport: UrlLibTransport | None = None,
+    account_label: str | None = None,
 ) -> dict[str, Any]:
     resolved_paths = paths or default_paths()
+    account = resolve_gmail_account(resolved_paths, account_label=account_label)
     transport = transport or UrlLibTransport()
-    access_token = ensure_access_token(resolved_paths, transport=transport)
+    access_token = ensure_access_token(resolved_paths, transport=transport, account_label=account.label)
     payload = json.dumps(
         {
             "message": {
@@ -593,6 +867,8 @@ def create_gmail_draft(
                     body_text=body_text,
                     cc_recipients=cc_recipients,
                     bcc_recipients=bcc_recipients,
+                    from_address=account.email or None,
+                    from_name=account.display_name or None,
                 )
             }
         }
@@ -605,6 +881,7 @@ def create_gmail_draft(
     )
     message = response.get("message") or {}
     return {
+        "account_label": account.label,
         "draft_id": str(response.get("id") or "").strip(),
         "message_id": str(message.get("id") or "").strip(),
         "thread_id": str(message.get("threadId") or "").strip(),
@@ -617,10 +894,12 @@ def send_gmail_draft(
     draft_id: str,
     paths: AthenaPaths | None = None,
     transport: UrlLibTransport | None = None,
+    account_label: str | None = None,
 ) -> dict[str, Any]:
     resolved_paths = paths or default_paths()
+    account = resolve_gmail_account(resolved_paths, account_label=account_label)
     transport = transport or UrlLibTransport()
-    access_token = ensure_access_token(resolved_paths, transport=transport)
+    access_token = ensure_access_token(resolved_paths, transport=transport, account_label=account.label)
     payload = json.dumps({"id": draft_id.strip()}).encode("utf-8")
     response = transport.request_json(
         "POST",
@@ -629,6 +908,7 @@ def send_gmail_draft(
         data=payload,
     )
     return {
+        "account_label": account.label,
         "message_id": str(response.get("id") or "").strip(),
         "thread_id": str(response.get("threadId") or "").strip(),
         "label_ids": list(response.get("labelIds") or []),
@@ -1354,17 +1634,28 @@ def parse_args() -> argparse.Namespace:
     auth_parser = subparsers.add_parser("auth-url", help="Generate the Google OAuth URL and store a PKCE session.")
     auth_parser.add_argument("--scope", dest="scopes", action="append", default=[])
     auth_parser.add_argument("--profile", default=None)
+    auth_parser.add_argument("--account", default=None)
     auth_parser.add_argument("--redirect-uri", default=DEFAULT_REDIRECT_URI)
+
+    login_parser = subparsers.add_parser("login", help="Open Google auth in a browser and exchange the code automatically.")
+    login_parser.add_argument("--scope", dest="scopes", action="append", default=[])
+    login_parser.add_argument("--profile", default=None)
+    login_parser.add_argument("--account", default=None)
+    login_parser.add_argument("--redirect-uri", default=DEFAULT_REDIRECT_URI)
+    login_parser.add_argument("--timeout", type=int, default=240)
+    login_parser.add_argument("--no-open-browser", action="store_true")
 
     exchange_parser = subparsers.add_parser("exchange-code", help="Exchange an OAuth code for local refresh/access tokens.")
     exchange_parser.add_argument("code")
+    exchange_parser.add_argument("--account", default=None)
 
     folders_parser = subparsers.add_parser("list-folders", help="List Drive folders after OAuth is connected.")
     folders_parser.add_argument("--parent-id", default="root")
     folders_parser.add_argument("--query", default=None)
     folders_parser.add_argument("--limit", type=int, default=50)
 
-    subparsers.add_parser("status", help="Show local Google OAuth status for Athena.")
+    status_parser = subparsers.add_parser("status", help="Show local Google OAuth status for Athena.")
+    status_parser.add_argument("--account", default=None)
     subparsers.add_parser("sync", help="Run the Google mirror pipeline once.")
     return parser.parse_args()
 
@@ -1380,17 +1671,37 @@ def main() -> int:
         scopes = list(args.scopes or [])
         if args.profile:
             scopes.insert(0, args.profile)
-        result = build_auth_url(paths, scopes=scopes or None, redirect_uri=args.redirect_uri)
+        result = build_auth_url(
+            paths,
+            scopes=scopes or None,
+            redirect_uri=args.redirect_uri,
+            account_label=args.account,
+        )
+        for key, value in result.items():
+            print(f"{key}: {value}")
+        return 0
+    if args.command == "login":
+        scopes = list(args.scopes or [])
+        if args.profile:
+            scopes.insert(0, args.profile)
+        result = authorize_with_local_browser(
+            paths,
+            scopes=scopes or None,
+            account_label=args.account,
+            redirect_uri=args.redirect_uri,
+            open_browser=not args.no_open_browser,
+            timeout_seconds=args.timeout,
+        )
         for key, value in result.items():
             print(f"{key}: {value}")
         return 0
     if args.command == "exchange-code":
-        result = exchange_code(args.code, paths)
+        result = exchange_code(args.code, paths, account_label=args.account)
         for key, value in result.items():
             print(f"{key}: {value}")
         return 0
     if args.command == "status":
-        result = oauth_status(paths)
+        result = oauth_status(paths, account_label=args.account)
         for key, value in result.items():
             print(f"{key}: {value}")
         return 0

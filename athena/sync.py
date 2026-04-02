@@ -25,6 +25,7 @@ from .source_docs import (
     title_from_path,
     upsert_source_document,
 )
+from .synthesis import generate_weekly_ceo_brief
 
 NOTEBOOKLM_LIFE_BUNDLE = "ATHENA_LIFE_CONTEXT_BUNDLE.md"
 
@@ -40,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     subparsers.add_parser("google", help="Mirror Gmail, Drive, and NotebookLM exports from Google.")
     subparsers.add_parser("repos", help="Scan project repos and refresh project health signals.")
     subparsers.add_parser("briefs", help="Refresh global, portfolio, and project awareness briefs.")
+    subparsers.add_parser("weekly-brief", help="Generate the weekly Athena CEO brief.")
     subparsers.add_parser("all", help="Run life, repos, and briefs together.")
 
     return parser.parse_args()
@@ -314,6 +316,11 @@ def run_sync(
             brief_summary = refresh_awareness_briefs(conn)
             summary["portfolios_briefed"] = brief_summary.get("portfolios", 0)
             summary["projects_briefed"] = brief_summary.get("projects", 0)
+        if command == "weekly-brief":
+            weekly_brief = generate_weekly_ceo_brief(conn, paths=resolved_paths)
+            summary["weekly_brief_path"] = weekly_brief["path"]
+            summary["weekly_brief_week_of"] = weekly_brief["week_of"]
+            summary["weekly_brief_summary"] = weekly_brief["summary"]
         conn.commit()
     return summary
 

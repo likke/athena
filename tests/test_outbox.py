@@ -17,6 +17,7 @@ def _test_paths(tmp_dir: Path):
         "db_path": tmp_dir / "tasks.sqlite",
         "workspace_root": tmp_dir / "workspace",
         "workspace_telegram_root": tmp_dir / "workspace-telegram",
+        "briefs_dir": tmp_dir / "workspace" / "system" / "briefs",
         "life_dir": tmp_dir / "life",
         "notebooklm_export_dir": tmp_dir / "life" / "notebooklm-exports",
         "google_dir": tmp_dir / "workspace" / "system" / "google",
@@ -51,6 +52,68 @@ class FakeTransport:
 
 
 class OutboxTests(unittest.TestCase):
+    def test_create_email_outbox_uses_default_configured_account(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            paths = _test_paths(tmp)
+            ensure_db(paths=paths)
+            account_dir = paths.google_dir / "accounts" / "athena"
+            account_dir.mkdir(parents=True, exist_ok=True)
+            paths.google_settings_path.write_text(
+                json.dumps(
+                    {
+                        "gmail": {
+                            "enabled": True,
+                            "default_account": "athena",
+                            "accounts": [
+                                {
+                                    "label": "athena",
+                                    "email": "athena@thirdteam.org",
+                                    "display_name": "Athena",
+                                    "default": True,
+                                    "token_path": "accounts/athena/token.json",
+                                }
+                            ],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (account_dir / "token.json").write_text(
+                json.dumps(
+                    {
+                        "access_token": "athena-access-token",
+                        "refresh_token": "athena-refresh-token",
+                        "expiry": 4102444800,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            transport = FakeTransport()
+            transport.add_json(
+                "gmail.googleapis.com/gmail/v1/users/me/drafts",
+                {
+                    "id": "draft-athena",
+                    "message": {"id": "msg-athena", "threadId": "thread-athena"},
+                },
+            )
+
+            item = create_email_outbox(
+                db_path=paths.db_path,
+                paths=paths,
+                to_recipients="client@example.com",
+                subject="Athena sender default",
+                body_text="Draft body",
+                actor="test",
+                transport=transport,
+            )
+
+            self.assertEqual(item["account_label"], "athena")
+            with connect_db(paths.db_path) as conn:
+                stored = conn.execute("SELECT account_label FROM outbox_items WHERE id = ?", (item["id"],)).fetchone()
+            assert stored is not None
+            self.assertEqual(stored["account_label"], "athena")
+
     def test_create_email_outbox_creates_gmail_draft_and_queue_row(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

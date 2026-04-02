@@ -12,6 +12,7 @@ class AthenaPaths:
     workspace_root: Path
     workspace_telegram_root: Path
     db_path: Path
+    briefs_dir: Path
     life_dir: Path
     notebooklm_export_dir: Path
     google_dir: Path
@@ -60,6 +61,10 @@ def default_paths() -> AthenaPaths:
         "ATHENA_LOCAL_LEDGER_PATH",
         task_view_dir / "TELEGRAM_LEDGER.md",
     )
+    briefs_dir = _expand_env_path(
+        "ATHENA_BRIEFS_DIR",
+        workspace_root / "system" / "briefs",
+    )
     life_dir = _expand_env_path(
         "ATHENA_LIFE_DIR",
         workspace_root / "life",
@@ -96,6 +101,7 @@ def default_paths() -> AthenaPaths:
         workspace_root=workspace_root,
         workspace_telegram_root=workspace_telegram_root,
         db_path=db_path,
+        briefs_dir=briefs_dir,
         life_dir=life_dir,
         notebooklm_export_dir=notebooklm_export_dir,
         google_dir=google_dir,
