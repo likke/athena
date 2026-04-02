@@ -61,23 +61,53 @@ cd /Users/fleirecastro/athena
 python3 -m athena.google init-settings
 ```
 
-5. Edit `~/.openclaw/workspace/system/google/settings.json` and replace the placeholder folder IDs.
+5. Check the current Google auth status:
 
-6. Generate the auth URL and local PKCE session:
+```bash
+python3 -m athena.google status
+```
+
+6. Edit `~/.openclaw/workspace/system/google/settings.json` and replace the placeholder folder IDs.
+
+By default Athena now requests the `athena-google-full` profile, which includes:
+
+- Gmail manage/compose/send
+- Drive full access
+- Docs
+- Sheets
+- Calendar
+- Contacts read-only
+- basic Google identity scopes
+
+If you want a narrower setup, change the `oauth.profile` value in `settings.json`.
+
+7. Generate the auth URL and local PKCE session:
 
 ```bash
 python3 -m athena.google auth-url
 ```
 
-7. Open the printed URL, approve access, then copy the `code=` value from the redirected browser URL.
+You can also force a specific profile or additional scopes:
 
-8. Exchange that code for a local token:
+```bash
+python3 -m athena.google auth-url --profile athena-google-full
+```
+
+8. Open the printed URL, approve access, then copy the `code=` value from the redirected browser URL.
+
+9. Exchange that code for a local token:
 
 ```bash
 python3 -m athena.google exchange-code "<PASTE_CODE_HERE>"
 ```
 
-9. Run the Google mirror:
+10. Re-check status:
+
+```bash
+python3 -m athena.google status
+```
+
+11. Run the Google mirror:
 
 ```bash
 python3 -m athena.sync google

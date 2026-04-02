@@ -22,10 +22,66 @@ from .source_docs import (
 )
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
+GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
+GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+DRIVE_FULL_SCOPE = "https://www.googleapis.com/auth/drive"
+DOCS_SCOPE = "https://www.googleapis.com/auth/documents"
+SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
+CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar"
+CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+PEOPLE_READONLY_SCOPE = "https://www.googleapis.com/auth/contacts.readonly"
+PROFILE_OPENID_SCOPE = "openid"
+PROFILE_EMAIL_SCOPE = "email"
+PROFILE_BASIC_SCOPE = "profile"
 SCOPE_ALIASES = {
     "gmail": GMAIL_READONLY_SCOPE,
+    "gmail-read": GMAIL_READONLY_SCOPE,
+    "gmail-readonly": GMAIL_READONLY_SCOPE,
+    "gmail-manage": GMAIL_MODIFY_SCOPE,
+    "gmail-modify": GMAIL_MODIFY_SCOPE,
+    "gmail-compose": GMAIL_COMPOSE_SCOPE,
+    "gmail-send": GMAIL_SEND_SCOPE,
     "drive": DRIVE_READONLY_SCOPE,
+    "drive-read": DRIVE_READONLY_SCOPE,
+    "drive-readonly": DRIVE_READONLY_SCOPE,
+    "drive-file": DRIVE_FILE_SCOPE,
+    "drive-write": DRIVE_FILE_SCOPE,
+    "drive-full": DRIVE_FULL_SCOPE,
+    "docs": DOCS_SCOPE,
+    "sheets": SHEETS_SCOPE,
+    "calendar": CALENDAR_SCOPE,
+    "calendar-read": CALENDAR_READONLY_SCOPE,
+    "calendar-readonly": CALENDAR_READONLY_SCOPE,
+    "contacts-read": PEOPLE_READONLY_SCOPE,
+    "contacts-readonly": PEOPLE_READONLY_SCOPE,
+    "openid": PROFILE_OPENID_SCOPE,
+    "email": PROFILE_EMAIL_SCOPE,
+    "profile": PROFILE_BASIC_SCOPE,
+}
+SCOPE_GROUPS = {
+    "athena-google-readonly": [
+        PROFILE_OPENID_SCOPE,
+        PROFILE_EMAIL_SCOPE,
+        PROFILE_BASIC_SCOPE,
+        GMAIL_READONLY_SCOPE,
+        DRIVE_READONLY_SCOPE,
+    ],
+    "athena-google-full": [
+        PROFILE_OPENID_SCOPE,
+        PROFILE_EMAIL_SCOPE,
+        PROFILE_BASIC_SCOPE,
+        GMAIL_MODIFY_SCOPE,
+        GMAIL_COMPOSE_SCOPE,
+        GMAIL_SEND_SCOPE,
+        DRIVE_FULL_SCOPE,
+        DOCS_SCOPE,
+        SHEETS_SCOPE,
+        CALENDAR_SCOPE,
+        PEOPLE_READONLY_SCOPE,
+    ],
 }
 DEFAULT_REDIRECT_URI = "http://127.0.0.1:8911/oauth2callback"
 
@@ -49,6 +105,8 @@ class DriveFolderSpec:
 
 @dataclass(frozen=True)
 class GoogleSyncSettings:
+    oauth_profile: str
+    oauth_scopes: tuple[str, ...]
     gmail: GmailMirrorSettings
     drive_folders: tuple[DriveFolderSpec, ...]
     notebooklm_folder: DriveFolderSpec | None
@@ -118,11 +176,20 @@ def _write_json(path: Path, payload: dict[str, Any]) -> Path:
 def _normalize_scopes(scopes: Iterable[str]) -> list[str]:
     resolved: list[str] = []
     for scope in scopes:
-        normalized = SCOPE_ALIASES.get(scope.strip().lower(), scope.strip())
+        clean = scope.strip()
+        if not clean:
+            continue
+        alias = clean.lower()
+        if alias in SCOPE_GROUPS:
+            for member in _normalize_scopes(SCOPE_GROUPS[alias]):
+                if member not in resolved:
+                    resolved.append(member)
+            continue
+        normalized = SCOPE_ALIASES.get(alias, clean)
         if normalized and normalized not in resolved:
             resolved.append(normalized)
     if not resolved:
-        resolved.extend([GMAIL_READONLY_SCOPE, DRIVE_READONLY_SCOPE])
+        resolved.extend(SCOPE_GROUPS["athena-google-readonly"])
     return resolved
 
 
@@ -145,6 +212,10 @@ def _expiry_from_token_response(payload: dict[str, Any]) -> int | None:
 def init_settings_template(paths: AthenaPaths | None = None, *, force: bool = False) -> Path:
     resolved_paths = paths or default_paths()
     template = {
+        "oauth": {
+            "profile": "athena-google-full",
+            "scopes": [],
+        },
         "gmail": {
             "enabled": True,
             "query": "in:inbox category:primary newer_than:30d",
@@ -175,12 +246,17 @@ def load_sync_settings(paths: AthenaPaths | None = None) -> GoogleSyncSettings:
     settings_path = resolved_paths.google_settings_path.expanduser().resolve()
     if not settings_path.exists():
         return GoogleSyncSettings(
+            oauth_profile="athena-google-full",
+            oauth_scopes=(),
             gmail=GmailMirrorSettings(),
             drive_folders=(),
             notebooklm_folder=None,
         )
 
     raw = json.loads(settings_path.read_text(encoding="utf-8"))
+    oauth = raw.get("oauth") or {}
+    oauth_profile = str(oauth.get("profile") or "athena-google-full")
+    oauth_scopes = tuple(str(item).strip() for item in (oauth.get("scopes") or []) if str(item).strip())
     gmail = raw.get("gmail") or {}
     gmail_settings = GmailMirrorSettings(
         enabled=bool(gmail.get("enabled", False)),
@@ -210,21 +286,33 @@ def load_sync_settings(paths: AthenaPaths | None = None) -> GoogleSyncSettings:
         )
 
     return GoogleSyncSettings(
+        oauth_profile=oauth_profile,
+        oauth_scopes=oauth_scopes,
         gmail=gmail_settings,
         drive_folders=tuple(drive_folders),
         notebooklm_folder=notebook_folder,
     )
 
 
+def requested_scopes(paths: AthenaPaths | None = None, scopes: Iterable[str] | None = None) -> list[str]:
+    resolved_paths = paths or default_paths()
+    explicit = list(scopes or [])
+    if explicit:
+        return _normalize_scopes(explicit)
+    settings = load_sync_settings(resolved_paths)
+    requested = [settings.oauth_profile, *settings.oauth_scopes]
+    return _normalize_scopes(requested)
+
+
 def build_auth_url(
     paths: AthenaPaths | None = None,
     *,
-    scopes: Iterable[str] = ("gmail", "drive"),
+    scopes: Iterable[str] | None = None,
     redirect_uri: str = DEFAULT_REDIRECT_URI,
 ) -> dict[str, Any]:
     resolved_paths = paths or default_paths()
     client = _load_client_config(resolved_paths)
-    normalized_scopes = _normalize_scopes(scopes)
+    normalized_scopes = requested_scopes(resolved_paths, scopes)
     session = {
         "state": secrets.token_urlsafe(24),
         "code_verifier": _code_verifier(),
@@ -333,6 +421,27 @@ def ensure_access_token(
     token_data["expiry"] = _expiry_from_token_response(refreshed)
     _write_json(resolved_paths.google_token_path, token_data)
     return str(token_data["access_token"])
+
+
+def oauth_status(paths: AthenaPaths | None = None) -> dict[str, Any]:
+    resolved_paths = paths or default_paths()
+    settings = load_sync_settings(resolved_paths)
+    status = {
+        "google_dir": str(resolved_paths.google_dir),
+        "settings_path": str(resolved_paths.google_settings_path),
+        "client_secret_path": str(resolved_paths.google_client_secrets_path),
+        "client_secret_present": resolved_paths.google_client_secrets_path.exists(),
+        "token_path": str(resolved_paths.google_token_path),
+        "token_present": resolved_paths.google_token_path.exists(),
+        "requested_scopes": requested_scopes(resolved_paths),
+        "oauth_profile": settings.oauth_profile,
+    }
+    if resolved_paths.google_token_path.exists():
+        token = _load_token_data(resolved_paths)
+        status["granted_scopes"] = str(token.get("scope") or "").split()
+        status["has_refresh_token"] = bool(token.get("refresh_token"))
+        status["token_expiry"] = token.get("expiry")
+    return status
 
 
 def _auth_headers(access_token: str) -> dict[str, str]:
@@ -701,11 +810,13 @@ def parse_args() -> argparse.Namespace:
 
     auth_parser = subparsers.add_parser("auth-url", help="Generate the Google OAuth URL and store a PKCE session.")
     auth_parser.add_argument("--scope", dest="scopes", action="append", default=[])
+    auth_parser.add_argument("--profile", default=None)
     auth_parser.add_argument("--redirect-uri", default=DEFAULT_REDIRECT_URI)
 
     exchange_parser = subparsers.add_parser("exchange-code", help="Exchange an OAuth code for local refresh/access tokens.")
     exchange_parser.add_argument("code")
 
+    subparsers.add_parser("status", help="Show local Google OAuth status for Athena.")
     subparsers.add_parser("sync", help="Run the Google mirror pipeline once.")
     return parser.parse_args()
 
@@ -718,12 +829,20 @@ def main() -> int:
         print(f"settings_path: {result}")
         return 0
     if args.command == "auth-url":
-        result = build_auth_url(paths, scopes=args.scopes or ("gmail", "drive"), redirect_uri=args.redirect_uri)
+        scopes = list(args.scopes or [])
+        if args.profile:
+            scopes.insert(0, args.profile)
+        result = build_auth_url(paths, scopes=scopes or None, redirect_uri=args.redirect_uri)
         for key, value in result.items():
             print(f"{key}: {value}")
         return 0
     if args.command == "exchange-code":
         result = exchange_code(args.code, paths)
+        for key, value in result.items():
+            print(f"{key}: {value}")
+        return 0
+    if args.command == "status":
+        result = oauth_status(paths)
         for key, value in result.items():
             print(f"{key}: {value}")
         return 0

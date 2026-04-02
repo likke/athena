@@ -11,9 +11,14 @@ from athena.config import default_paths
 from athena.db import connect_db, ensure_db
 from athena.google import (
     GMAIL_READONLY_SCOPE,
+    GMAIL_MODIFY_SCOPE,
+    DRIVE_FULL_SCOPE,
+    DOCS_SCOPE,
     build_auth_url,
     exchange_code,
     mirror_google_sources,
+    oauth_status,
+    requested_scopes,
 )
 
 
@@ -103,6 +108,44 @@ class GoogleTestCase(unittest.TestCase):
             self.assertEqual(token["access_token"], "access-token")
             self.assertEqual(token["refresh_token"], "refresh-token")
             self.assertGreater(token["expiry"], 0)
+
+    def test_requested_scopes_and_status_use_full_profile(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            paths = _test_paths(tmp)
+            paths.google_dir.mkdir(parents=True, exist_ok=True)
+            paths.google_settings_path.write_text(
+                json.dumps(
+                    {
+                        "oauth": {
+                            "profile": "athena-google-full",
+                            "scopes": [],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            paths.google_token_path.write_text(
+                json.dumps(
+                    {
+                        "access_token": "cached-access-token",
+                        "refresh_token": "refresh-token",
+                        "expiry": 4102444800,
+                        "scope": " ".join([GMAIL_MODIFY_SCOPE, DRIVE_FULL_SCOPE, DOCS_SCOPE]),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            scopes = requested_scopes(paths)
+            self.assertIn(GMAIL_MODIFY_SCOPE, scopes)
+            self.assertIn(DRIVE_FULL_SCOPE, scopes)
+            self.assertIn(DOCS_SCOPE, scopes)
+
+            status = oauth_status(paths)
+            self.assertEqual(status["oauth_profile"], "athena-google-full")
+            self.assertTrue(status["token_present"])
+            self.assertIn(GMAIL_MODIFY_SCOPE, status["granted_scopes"])
 
     def test_mirror_google_sources_syncs_gmail_drive_and_notebooklm(self):
         with tempfile.TemporaryDirectory() as tmpdir:
