@@ -11,6 +11,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -108,6 +109,12 @@ class CalendarSyncSettings:
 
 
 @dataclass(frozen=True)
+class ContactsSyncSettings:
+    enabled: bool = True
+    page_size: int = 200
+
+
+@dataclass(frozen=True)
 class DriveFolderSpec:
     id: str
     name: str
@@ -120,6 +127,7 @@ class GoogleSyncSettings:
     include_granted_scopes: bool
     gmail: GmailMirrorSettings
     calendar: CalendarSyncSettings
+    contacts: ContactsSyncSettings
     drive_folders: tuple[DriveFolderSpec, ...]
     notebooklm_folder: DriveFolderSpec | None
 
@@ -241,6 +249,10 @@ def init_settings_template(paths: AthenaPaths | None = None, *, force: bool = Fa
             "days_ahead": 14,
             "max_results": 25,
         },
+        "contacts": {
+            "enabled": True,
+            "page_size": 200,
+        },
         "drive": {
             "folders": [
                 {
@@ -271,6 +283,7 @@ def load_sync_settings(paths: AthenaPaths | None = None) -> GoogleSyncSettings:
             include_granted_scopes=False,
             gmail=GmailMirrorSettings(),
             calendar=CalendarSyncSettings(),
+            contacts=ContactsSyncSettings(enabled=False),
             drive_folders=(),
             notebooklm_folder=None,
         )
@@ -294,6 +307,11 @@ def load_sync_settings(paths: AthenaPaths | None = None) -> GoogleSyncSettings:
         days_back=max(0, int(calendar.get("days_back") or CalendarSyncSettings.days_back)),
         days_ahead=max(0, int(calendar.get("days_ahead") or CalendarSyncSettings.days_ahead)),
         max_results=max(1, int(calendar.get("max_results") or CalendarSyncSettings.max_results)),
+    )
+    contacts = raw.get("contacts") or {}
+    contacts_settings = ContactsSyncSettings(
+        enabled=bool(contacts.get("enabled", ContactsSyncSettings.enabled)),
+        page_size=max(1, int(contacts.get("page_size") or ContactsSyncSettings.page_size)),
     )
 
     drive_folders: list[DriveFolderSpec] = []
@@ -323,6 +341,7 @@ def load_sync_settings(paths: AthenaPaths | None = None) -> GoogleSyncSettings:
         include_granted_scopes=include_granted_scopes,
         gmail=gmail_settings,
         calendar=calendar_settings,
+        contacts=contacts_settings,
         drive_folders=tuple(drive_folders),
         notebooklm_folder=notebook_folder,
     )
@@ -532,6 +551,91 @@ def _gmail_body(payload: dict[str, Any]) -> str:
     return "\n\n".join(item for item in html_fallback if item)
 
 
+def _gmail_raw_message(
+    *,
+    to_recipients: str,
+    subject: str,
+    body_text: str,
+    cc_recipients: str | None = None,
+    bcc_recipients: str | None = None,
+) -> str:
+    message = EmailMessage()
+    message["To"] = to_recipients
+    if cc_recipients:
+        message["Cc"] = cc_recipients
+    if bcc_recipients:
+        message["Bcc"] = bcc_recipients
+    message["Subject"] = subject
+    message.set_content(body_text)
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
+    return raw.rstrip("=")
+
+
+def create_gmail_draft(
+    *,
+    to_recipients: str,
+    subject: str,
+    body_text: str,
+    paths: AthenaPaths | None = None,
+    cc_recipients: str | None = None,
+    bcc_recipients: str | None = None,
+    transport: UrlLibTransport | None = None,
+) -> dict[str, Any]:
+    resolved_paths = paths or default_paths()
+    transport = transport or UrlLibTransport()
+    access_token = ensure_access_token(resolved_paths, transport=transport)
+    payload = json.dumps(
+        {
+            "message": {
+                "raw": _gmail_raw_message(
+                    to_recipients=to_recipients,
+                    subject=subject,
+                    body_text=body_text,
+                    cc_recipients=cc_recipients,
+                    bcc_recipients=bcc_recipients,
+                )
+            }
+        }
+    ).encode("utf-8")
+    response = transport.request_json(
+        "POST",
+        "https://gmail.googleapis.com/gmail/v1/users/me/drafts",
+        headers={**_auth_headers(access_token), "Content-Type": "application/json"},
+        data=payload,
+    )
+    message = response.get("message") or {}
+    return {
+        "draft_id": str(response.get("id") or "").strip(),
+        "message_id": str(message.get("id") or "").strip(),
+        "thread_id": str(message.get("threadId") or "").strip(),
+        "external_url": "https://mail.google.com/mail/u/0/#drafts",
+    }
+
+
+def send_gmail_draft(
+    *,
+    draft_id: str,
+    paths: AthenaPaths | None = None,
+    transport: UrlLibTransport | None = None,
+) -> dict[str, Any]:
+    resolved_paths = paths or default_paths()
+    transport = transport or UrlLibTransport()
+    access_token = ensure_access_token(resolved_paths, transport=transport)
+    payload = json.dumps({"id": draft_id.strip()}).encode("utf-8")
+    response = transport.request_json(
+        "POST",
+        "https://gmail.googleapis.com/gmail/v1/users/me/drafts/send",
+        headers={**_auth_headers(access_token), "Content-Type": "application/json"},
+        data=payload,
+    )
+    return {
+        "message_id": str(response.get("id") or "").strip(),
+        "thread_id": str(response.get("threadId") or "").strip(),
+        "label_ids": list(response.get("labelIds") or []),
+        "external_url": "https://mail.google.com/mail/u/0/#sent",
+    }
+
+
 def _iso_timestamp(raw_ms: str | int | None) -> str:
     if not raw_ms:
         return ""
@@ -564,6 +668,21 @@ def _calendar_event_when(event: dict[str, Any]) -> str:
     if start and end:
         return f"{start} -> {end}"
     return start or end or "unknown"
+
+
+def _contact_primary_text(items: list[dict[str, Any]] | None, field_name: str) -> str:
+    for item in items or []:
+        value = str(item.get(field_name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _contact_person_id(person: dict[str, Any]) -> str:
+    resource_name = str(person.get("resourceName") or "").strip()
+    candidate = resource_name or _contact_primary_text(person.get("emailAddresses"), "value") or _contact_primary_text(person.get("names"), "displayName")
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", candidate).strip("-") or "contact"
+    return f"person-google-{safe.lower()}"
 
 
 def _write_text(path: Path, content: str) -> Path:
@@ -906,6 +1025,137 @@ def _mirror_calendar(
     return {"calendar_events": mirrored}
 
 
+def _contacts_list(
+    *,
+    access_token: str,
+    transport: UrlLibTransport,
+    page_size: int,
+    page_token: str | None = None,
+) -> dict[str, Any]:
+    params = {
+        "pageSize": page_size,
+        "personFields": "names,emailAddresses,organizations,biographies",
+        "sortOrder": "LAST_MODIFIED_DESCENDING",
+    }
+    if page_token:
+        params["pageToken"] = page_token
+    response = transport.request_json(
+        "GET",
+        f"https://people.googleapis.com/v1/people/me/connections?{urllib.parse.urlencode(params)}",
+        headers=_auth_headers(access_token),
+    )
+    return dict(response or {})
+
+
+def _mirror_contacts(
+    conn,
+    *,
+    paths: AthenaPaths,
+    settings: ContactsSyncSettings,
+    transport: UrlLibTransport,
+    access_token: str,
+) -> dict[str, int]:
+    base_dir = _ensure_dir(paths.google_mirror_dir / "contacts")
+    summary_lines = [
+        "# Google Contacts Mirror",
+        "",
+        f"- page_size: {settings.page_size}",
+        "",
+    ]
+
+    mirrored = 0
+    page_token: str | None = None
+    while True:
+        payload = _contacts_list(
+            access_token=access_token,
+            transport=transport,
+            page_size=settings.page_size,
+            page_token=page_token,
+        )
+        connections = payload.get("connections") or []
+        for person in connections:
+            name = _contact_primary_text(person.get("names"), "displayName") or "Unnamed contact"
+            email = _contact_primary_text(person.get("emailAddresses"), "value")
+            organization = _contact_primary_text(person.get("organizations"), "name")
+            bio = _contact_primary_text(person.get("biographies"), "value")
+            person_id = _contact_person_id(person)
+            slug = person_id.removeprefix("person-")
+            markdown_lines = [
+                f"# {name}",
+                "",
+                f"- email: {email or 'n/a'}",
+                f"- organization: {organization or 'n/a'}",
+                f"- resource_name: {str(person.get('resourceName') or 'n/a')}",
+                "",
+            ]
+            if bio:
+                markdown_lines.extend(["## Notes", "", bio, ""])
+            mirror_path = _write_text(base_dir / f"{person_id}.md", "\n".join(markdown_lines))
+            doc_id = choose_document_id(conn, mirror_path, person_id)
+            upsert_source_document(
+                conn,
+                doc_id=doc_id,
+                kind="contact_profile",
+                title=name,
+                path=mirror_path,
+                source_system="gpeople",
+                is_authoritative=False,
+                summary=text_summary(" ".join(part for part in [name, email, organization, bio] if part)),
+                external_url="https://contacts.google.com/",
+            )
+            dedupe_source_documents(conn, mirror_path, doc_id)
+
+            existing = conn.execute("SELECT created_at FROM people WHERE id = ?", (person_id,)).fetchone()
+            created_at = int(existing["created_at"]) if existing else int(datetime.now(tz=timezone.utc).timestamp())
+            conn.execute(
+                """
+                INSERT INTO people (
+                  id, slug, name, relationship_type, importance_score, notes, contact_rule, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  slug = excluded.slug,
+                  name = excluded.name,
+                  relationship_type = excluded.relationship_type,
+                  importance_score = excluded.importance_score,
+                  notes = excluded.notes,
+                  contact_rule = excluded.contact_rule,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    person_id,
+                    slug,
+                    name,
+                    "google_contact",
+                    10 if email else 1,
+                    organization or bio or None,
+                    email or None,
+                    created_at,
+                    int(datetime.now(tz=timezone.utc).timestamp()),
+                ),
+            )
+            summary_lines.append(f"- {name} — {email or organization or 'no email'}")
+            mirrored += 1
+        page_token = str(payload.get("nextPageToken") or "").strip() or None
+        if not page_token:
+            break
+
+    summary_path = _write_text(base_dir / "contacts-summary.md", "\n".join(summary_lines))
+    doc_id = choose_document_id(conn, summary_path, "gpeople-contacts-summary")
+    upsert_source_document(
+        conn,
+        doc_id=doc_id,
+        kind="contacts_summary",
+        title="Google Contacts Summary",
+        path=summary_path,
+        source_system="gpeople",
+        is_authoritative=False,
+        summary=f"{mirrored} mirrored Google contacts",
+        external_url="https://contacts.google.com/",
+    )
+    dedupe_source_documents(conn, summary_path, doc_id)
+    return {"contacts_synced": mirrored}
+
+
 def _mirror_drive_folder(
     conn,
     *,
@@ -990,6 +1240,7 @@ def mirror_google_sources(
     if (
         not settings.gmail.enabled
         and not settings.calendar.enabled
+        and not settings.contacts.enabled
         and not settings.drive_folders
         and settings.notebooklm_folder is None
     ):
@@ -997,6 +1248,7 @@ def mirror_google_sources(
             "google_enabled": False,
             "gmail_messages": 0,
             "calendar_events": 0,
+            "contacts_synced": 0,
             "drive_files": 0,
             "notebooklm_files": 0,
             "reason": "google settings are not configured",
@@ -1008,6 +1260,7 @@ def mirror_google_sources(
         "google_enabled": True,
         "gmail_messages": 0,
         "calendar_events": 0,
+        "contacts_synced": 0,
         "drive_files": 0,
         "notebooklm_files": 0,
     }
@@ -1039,6 +1292,20 @@ def mirror_google_sources(
             )
         except (urllib.error.HTTPError, urllib.error.URLError) as exc:
             summary["calendar_error"] = _google_error_message(exc)
+
+    if settings.contacts.enabled:
+        try:
+            summary.update(
+                _mirror_contacts(
+                    conn,
+                    paths=resolved_paths,
+                    settings=settings.contacts,
+                    transport=transport,
+                    access_token=access_token,
+                )
+            )
+        except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+            summary["contacts_error"] = _google_error_message(exc)
 
     drive_total = 0
     try:

@@ -211,6 +211,39 @@ CREATE TABLE IF NOT EXISTS task_events (
   created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS outbox_items (
+  id TEXT PRIMARY KEY,
+  task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+  project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+  provider TEXT NOT NULL CHECK (provider IN ('gmail')),
+  account_label TEXT NOT NULL DEFAULT 'primary',
+  to_recipients TEXT NOT NULL,
+  cc_recipients TEXT,
+  bcc_recipients TEXT,
+  subject TEXT NOT NULL,
+  body_text TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('drafting', 'needs_approval', 'approved', 'sending', 'sent', 'rejected', 'cancelled', 'error')),
+  draft_id TEXT,
+  external_ref TEXT,
+  external_url TEXT,
+  approval_note TEXT,
+  error_message TEXT,
+  sent_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS outbox_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  outbox_id TEXT NOT NULL REFERENCES outbox_items(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  from_status TEXT,
+  to_status TEXT,
+  note TEXT,
+  actor TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS project_updates (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -263,6 +296,9 @@ CREATE INDEX IF NOT EXISTS idx_tasks_bucket_status ON tasks(bucket, status, prio
 CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status, priority DESC, last_touched_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_goal_status ON tasks(life_goal_id, status, priority DESC, last_touched_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_outbox_items_status ON outbox_items(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_outbox_items_task ON outbox_items(task_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_outbox_events_item ON outbox_events(outbox_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_project_updates_project ON project_updates(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_awareness_briefs_scope ON awareness_briefs(scope_kind, scope_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_captured_items_status ON captured_items(status, created_at DESC);

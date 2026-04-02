@@ -137,6 +137,11 @@ def _insert_completion_record(
     return int(cursor.lastrowid)
 
 
+def _normalize_evidence(evidence: list[str] | None) -> list[str]:
+    cleaned = [item.strip() for item in (evidence or []) if item and item.strip()]
+    return cleaned
+
+
 def _make_task_id(conn: sqlite3.Connection, title: str) -> str:
     base = f"task-{slugify(title)}"
     candidate = base
@@ -476,6 +481,9 @@ def complete_task(
         raise StateTransitionError(f"Unsupported task resolution: {resolution}")
     if not summary.strip():
         raise StateTransitionError("Task completion requires a non-empty summary")
+    normalized_evidence = _normalize_evidence(evidence)
+    if not normalized_evidence:
+        raise StateTransitionError("Task completion requires at least one evidence item")
     resolved_db = _resolve_db(db_path)
     ensure_db(resolved_db)
     with connect_db(resolved_db) as conn:
@@ -488,7 +496,7 @@ def complete_task(
             entity_id=task_id,
             resolution=resolution,
             summary=summary,
-            evidence=evidence,
+            evidence=normalized_evidence,
             actor=actor,
             verified_by=verified_by,
         )

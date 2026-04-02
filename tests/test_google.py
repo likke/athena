@@ -17,11 +17,13 @@ from athena.google import (
     DRIVE_FULL_SCOPE,
     DOCS_SCOPE,
     build_auth_url,
+    create_gmail_draft,
     exchange_code,
     list_drive_folders,
     mirror_google_sources,
     oauth_status,
     requested_scopes,
+    send_gmail_draft,
 )
 
 
@@ -214,6 +216,10 @@ class GoogleTestCase(unittest.TestCase):
                             "days_ahead": 14,
                             "max_results": 5,
                         },
+                        "contacts": {
+                            "enabled": True,
+                            "page_size": 50,
+                        },
                         "drive": {
                             "folders": [
                                 {
@@ -317,6 +323,20 @@ class GoogleTestCase(unittest.TestCase):
                     ]
                 },
             )
+            transport.add_json(
+                "people.googleapis.com/v1/people/me/connections?",
+                {
+                    "connections": [
+                        {
+                            "resourceName": "people/c123",
+                            "names": [{"displayName": "Kent Dev"}],
+                            "emailAddresses": [{"value": "kent@example.com"}],
+                            "organizations": [{"name": "Third Team Ventures"}],
+                            "biographies": [{"value": "Junior dev on DashoContent."}],
+                        }
+                    ]
+                },
+            )
             transport.add_bytes("/files/doc-1/export?mimeType=text/plain", b"Drive project note text")
             transport.add_bytes("/files/note-1?alt=media", b"Notebook life goal text")
 
@@ -326,10 +346,12 @@ class GoogleTestCase(unittest.TestCase):
 
             self.assertEqual(result["gmail_messages"], 1)
             self.assertEqual(result["calendar_events"], 1)
+            self.assertEqual(result["contacts_synced"], 1)
             self.assertEqual(result["drive_files"], 1)
             self.assertEqual(result["notebooklm_files"], 1)
             self.assertTrue((paths.google_mirror_dir / "gmail" / "msg-1.md").exists())
             self.assertTrue((paths.google_mirror_dir / "calendar" / "events" / "evt-1.md").exists())
+            self.assertTrue((paths.google_mirror_dir / "contacts" / "person-google-people-c123.md").exists())
             self.assertTrue((paths.notebooklm_export_dir / "Notebook-Goals-note-1.txt").exists())
             with connect_db(paths.db_path) as conn:
                 rows = list(
@@ -342,9 +364,16 @@ class GoogleTestCase(unittest.TestCase):
                 self.assertIn(("gcal", "calendar_agenda"), source_kinds)
                 self.assertIn(("gmail", "gmail_message"), source_kinds)
                 self.assertIn(("gmail", "gmail_mailbox"), source_kinds)
+                self.assertIn(("gpeople", "contact_profile"), source_kinds)
+                self.assertIn(("gpeople", "contacts_summary"), source_kinds)
                 self.assertIn(("gdrive", "drive_file"), source_kinds)
                 self.assertIn(("gdrive", "drive_file_summary"), source_kinds)
                 self.assertIn(("NotebookLM", "notebooklm_export_summary"), source_kinds)
+                person = conn.execute("SELECT * FROM people WHERE id = ?", ("person-google-people-c123",)).fetchone()
+                self.assertIsNotNone(person)
+                assert person is not None
+                self.assertEqual(person["name"], "Kent Dev")
+                self.assertEqual(person["contact_rule"], "kent@example.com")
 
     def test_mirror_google_sources_reports_calendar_service_errors_without_crashing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -361,7 +390,10 @@ class GoogleTestCase(unittest.TestCase):
                             "days_back": 0,
                             "days_ahead": 14,
                             "max_results": 5,
-                        }
+                        },
+                        "contacts": {
+                            "enabled": False,
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -421,6 +453,61 @@ class GoogleTestCase(unittest.TestCase):
             rows = list_drive_folders(paths=paths, transport=transport, query="NotebookLM", limit=10)
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["id"], "folder-1")
+
+    def test_create_and_send_gmail_draft(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            paths = _test_paths(tmp)
+            paths.google_dir.mkdir(parents=True, exist_ok=True)
+            paths.google_token_path.write_text(
+                json.dumps(
+                    {
+                        "access_token": "cached-access-token",
+                        "refresh_token": "refresh-token",
+                        "expiry": 4102444800,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            transport = FakeTransport()
+            transport.add_json(
+                "gmail.googleapis.com/gmail/v1/users/me/drafts/send",
+                {
+                    "id": "sent-1",
+                    "threadId": "thread-1",
+                    "labelIds": ["SENT"],
+                },
+            )
+            transport.add_json(
+                "gmail.googleapis.com/gmail/v1/users/me/drafts",
+                {
+                    "id": "draft-1",
+                    "message": {
+                        "id": "msg-1",
+                        "threadId": "thread-1",
+                    },
+                },
+            )
+
+            draft = create_gmail_draft(
+                paths=paths,
+                to_recipients="person@example.com",
+                cc_recipients="cc@example.com",
+                subject="Follow-up",
+                body_text="Thanks for the call.",
+                transport=transport,
+            )
+            self.assertEqual(draft["draft_id"], "draft-1")
+            self.assertEqual(draft["message_id"], "msg-1")
+
+            sent = send_gmail_draft(
+                paths=paths,
+                draft_id="draft-1",
+                transport=transport,
+            )
+            self.assertEqual(sent["message_id"], "sent-1")
+            self.assertIn("SENT", sent["label_ids"])
 
 
 if __name__ == "__main__":

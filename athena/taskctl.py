@@ -8,6 +8,12 @@ from typing import Any
 
 from .config import default_paths
 from .db import connect_db, ensure_db, now_ts, row_to_dict
+from .outbox import (
+    approve_outbox_items,
+    create_email_outbox,
+    reject_outbox_items,
+    send_outbox_items,
+)
 from .render_markdown import render
 from .reviews import run_review_cycle
 from .rollups import refresh_rollups
@@ -28,6 +34,7 @@ DEFAULT_CHANNEL = "telegram"
 DEFAULT_CHAT_ID = "1937792843"
 OPEN_TASK_STATUSES = ("queued", "in_progress", "blocked", "someday")
 CLOSED_TASK_STATUSES = ("done", "cancelled")
+OPEN_OUTBOX_STATUSES = ("drafting", "needs_approval", "approved", "sending", "error")
 TASK_COLUMNS = (
     "capture_id",
     "life_area_id",
@@ -219,6 +226,30 @@ def parse_args() -> argparse.Namespace:
     focus_parser.add_argument("--last-user-intent", default=None)
     focus_parser.add_argument("--last-progress", default=None)
     focus_parser.add_argument("--pending-approval-task-id", default=None)
+
+    outbox_parser = subparsers.add_parser("queue-email", parents=[common], help="Create a Gmail draft in Athena's approval queue.")
+    outbox_parser.add_argument("--to", dest="to_recipients", required=True)
+    outbox_parser.add_argument("--cc", dest="cc_recipients", default=None)
+    outbox_parser.add_argument("--bcc", dest="bcc_recipients", default=None)
+    outbox_parser.add_argument("--subject", required=True)
+    outbox_parser.add_argument("--body", required=True)
+    outbox_parser.add_argument("--task-id", default=None)
+    outbox_parser.add_argument("--project-id", default=None)
+    outbox_parser.add_argument("--actor", default="athena")
+
+    approve_outbox_parser = subparsers.add_parser("approve-outbox", parents=[common], help="Approve one or more outbox items.")
+    approve_outbox_parser.add_argument("item_ids", nargs="+")
+    approve_outbox_parser.add_argument("--note", default=None)
+    approve_outbox_parser.add_argument("--actor", default="athena")
+
+    reject_outbox_parser = subparsers.add_parser("reject-outbox", parents=[common], help="Reject one or more outbox items.")
+    reject_outbox_parser.add_argument("item_ids", nargs="+")
+    reject_outbox_parser.add_argument("--note", default=None)
+    reject_outbox_parser.add_argument("--actor", default="athena")
+
+    send_outbox_parser = subparsers.add_parser("send-outbox", parents=[common], help="Send approved outbox items or a selected subset.")
+    send_outbox_parser.add_argument("item_ids", nargs="*")
+    send_outbox_parser.add_argument("--actor", default="athena")
 
     return parser.parse_args()
 
@@ -513,6 +544,19 @@ def current_state(db_path: Path, channel: str, chat_id: str) -> dict[str, Any]:
                 (channel, chat_id),
             ).fetchall()
         ]
+        outbox_items = [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT id, subject, status, to_recipients, task_id, project_id, updated_at, draft_id, external_url
+                FROM outbox_items
+                WHERE status IN ({", ".join("?" for _ in OPEN_OUTBOX_STATUSES)})
+                ORDER BY updated_at DESC
+                LIMIT 12
+                """,
+                OPEN_OUTBOX_STATUSES,
+            ).fetchall()
+        ]
         recent_events = [
             dict(row)
             for row in conn.execute(
@@ -533,6 +577,7 @@ def current_state(db_path: Path, channel: str, chat_id: str) -> dict[str, Any]:
         "current": current,
         "open_tasks": open_tasks,
         "inbox_items": inbox_items,
+        "outbox_items": outbox_items,
         "recent_events": recent_events,
         "db": str(db_path),
     }
@@ -699,6 +744,38 @@ def main() -> int:
                 last_user_intent=args.last_user_intent,
                 last_progress=args.last_progress,
                 pending_approval_task_id=args.pending_approval_task_id,
+            )
+        elif args.command == "queue-email":
+            result = create_email_outbox(
+                db_path=db_path,
+                to_recipients=args.to_recipients,
+                cc_recipients=args.cc_recipients,
+                bcc_recipients=args.bcc_recipients,
+                subject=args.subject,
+                body_text=args.body,
+                task_id=args.task_id,
+                project_id=args.project_id,
+                actor=args.actor,
+            )
+        elif args.command == "approve-outbox":
+            result = approve_outbox_items(
+                db_path=db_path,
+                outbox_ids=args.item_ids,
+                note=args.note,
+                actor=args.actor,
+            )
+        elif args.command == "reject-outbox":
+            result = reject_outbox_items(
+                db_path=db_path,
+                outbox_ids=args.item_ids,
+                note=args.note,
+                actor=args.actor,
+            )
+        elif args.command == "send-outbox":
+            result = send_outbox_items(
+                db_path=db_path,
+                outbox_ids=args.item_ids or None,
+                actor=args.actor,
             )
         else:
             raise ValueError(f"Unsupported command: {args.command}")

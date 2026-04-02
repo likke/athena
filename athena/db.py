@@ -132,6 +132,17 @@ def dashboard_snapshot(db_path: Path | None = None) -> dict[str, Any]:
             FROM tasks
             """,
         ) or {}
+        outbox = query_one(
+            conn,
+            """
+            SELECT
+              COALESCE(SUM(CASE WHEN status = 'needs_approval' THEN 1 ELSE 0 END), 0) AS outbox_needs_approval,
+              COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0) AS outbox_approved,
+              COALESCE(SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END), 0) AS outbox_sent,
+              COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0) AS outbox_errors
+            FROM outbox_items
+            """,
+        ) or {}
         inbox = query_one(
             conn,
             """
@@ -211,6 +222,7 @@ def dashboard_snapshot(db_path: Path | None = None) -> dict[str, Any]:
         )
     return {
         "counts": counts,
+        "outbox": outbox,
         "inbox": inbox,
         "project_health": project_health,
         "active_projects": active_projects,

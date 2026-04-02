@@ -7,17 +7,19 @@ It keeps three layers in one place:
 - life context
 - portfolio and project status
 - execution truth
-- Google-aware mirrors for Gmail, Calendar, Drive, and NotebookLM exports
+- Google-aware mirrors for Gmail, Calendar, Contacts, Drive, and NotebookLM exports
+- Gmail draft approval and send tracking through a local outbox queue
 
 The app is designed to work against the same SQLite database already used by the live OpenClaw/Athena task-routing flow, so Telegram can keep using the current runtime while the board, sync jobs, and repo/project status live in a real codebase.
 
 ## What This Repo Contains
 
 - `athena.taskctl`: DB-first task state read/write helper
+- `athena.outbox`: Gmail draft, approval, reject, and send state
 - `athena.render_markdown`: generated compatibility views for Telegram bucket files
 - `athena.sync`: life-doc, awareness-brief, and repo-status sync commands
-- `athena.google`: local Google OAuth and Gmail / Calendar / Drive / NotebookLM mirror helpers
-- `athena.server`: local HTTP dashboard / board
+- `athena.google`: local Google OAuth and Gmail / Calendar / Contacts / Drive / NotebookLM helpers
+- `athena.server`: local HTTP dashboard / board with batch email approvals
 
 ## Default Data Paths
 
@@ -135,10 +137,28 @@ If Google sync reports a `calendar_error` with `accessNotConfigured`, the Google
 
 - Gmail inbox messages into `~/.openclaw/workspace/system/google-mirror/gmail/`
 - upcoming calendar agenda and events into `~/.openclaw/workspace/system/google-mirror/calendar/`
+- Google contacts into `~/.openclaw/workspace/system/google-mirror/contacts/`
 - text-capable Drive files into `~/.openclaw/workspace/system/google-mirror/drive/`
 - NotebookLM export files from a Drive folder into `~/.openclaw/workspace/life/notebooklm-exports/`
 
 The important rule is: NotebookLM is not the source of truth. Athena mirrors the useful parts into local files and then ingests those into the normal `source_documents` layer.
+
+## Email Outbox
+
+Athena now has a local `outbox_items` queue in the same SQLite database as tasks and projects.
+
+- create Gmail drafts locally through the board or `taskctl`
+- approve several queued emails at once
+- send only approved drafts
+- track draft ids, send state, errors, and sent timestamps
+
+Useful commands:
+
+```bash
+python3 -m athena.taskctl queue-email --to "person@example.com" --subject "Follow-up" --body "Draft body"
+python3 -m athena.taskctl approve-outbox outbox-follow-up
+python3 -m athena.taskctl send-outbox
+```
 
 ## Goals
 

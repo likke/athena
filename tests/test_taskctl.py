@@ -126,6 +126,52 @@ class TaskCtlTests(unittest.TestCase):
             self.assertFalse(err["ok"])
             self.assertIn("Expecting property name enclosed in double quotes", err["error"])
 
+    def test_cli_queue_email_and_outbox_actions_route_through_module(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "tasks.sqlite"
+
+            stdout = io.StringIO()
+            with patch(
+                "athena.taskctl.create_email_outbox",
+                return_value={"id": "outbox-1", "status": "needs_approval"},
+            ) as create_mock, patch(
+                "sys.argv",
+                [
+                    "taskctl",
+                    "queue-email",
+                    "--db",
+                    str(db_path),
+                    "--to",
+                    "person@example.com",
+                    "--subject",
+                    "Follow-up",
+                    "--body",
+                    "Draft body",
+                ],
+            ), contextlib.redirect_stdout(stdout):
+                exit_code = main()
+
+            self.assertEqual(exit_code, 0)
+            create_mock.assert_called_once()
+            data = json.loads(stdout.getvalue())
+            self.assertEqual(data["id"], "outbox-1")
+
+            stdout = io.StringIO()
+            with patch(
+                "athena.taskctl.approve_outbox_items",
+                return_value={"updated_count": 2, "items": []},
+            ) as approve_mock, patch(
+                "sys.argv",
+                ["taskctl", "approve-outbox", "--db", str(db_path), "outbox-1", "outbox-2"],
+            ), contextlib.redirect_stdout(stdout):
+                exit_code = main()
+
+            self.assertEqual(exit_code, 0)
+            approve_mock.assert_called_once()
+            approve_data = json.loads(stdout.getvalue())
+            self.assertEqual(approve_data["updated_count"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 import urllib.request
 import types
 import sys
@@ -47,7 +48,7 @@ class AthenaServerTest(unittest.TestCase):
         self._env_backup = {key: os.environ.get(key) for key in self.ENV_KEYS}
         for key, value in env_values.items():
             os.environ[key] = value
-        self.state_calls: list[tuple[str, str]] = []
+        self.state_calls: list[dict[str, object]] = []
         state_stub = types.SimpleNamespace(
             capture_item=self._state_handler("capture"),
             create_task=self._state_handler("create"),
@@ -57,7 +58,14 @@ class AthenaServerTest(unittest.TestCase):
             reopen_task=self._state_handler("reopen"),
             update_project_status=self._state_handler("project"),
         )
+        outbox_stub = types.SimpleNamespace(
+            create_email_outbox=self._state_handler("outbox-create"),
+            approve_outbox_items=self._state_handler("outbox-approve"),
+            reject_outbox_items=self._state_handler("outbox-reject"),
+            send_outbox_items=self._state_handler("outbox-send"),
+        )
         sys.modules["athena.state"] = state_stub
+        sys.modules["athena.outbox"] = outbox_stub
         self.paths = default_paths()
         db_module.ensure_db(paths=self.paths)
         self._insert_sample(self.paths.db_path)
@@ -74,11 +82,18 @@ class AthenaServerTest(unittest.TestCase):
             else:
                 os.environ[key] = value
         sys.modules.pop("athena.state", None)
+        sys.modules.pop("athena.outbox", None)
 
     def _state_handler(self, action: str):
         def handler(*args, **kwargs):
             target = kwargs.get("task_id") or kwargs.get("project_id") or kwargs.get("capture_id") or (args[0] if args else action)
-            self.state_calls.append((action, str(target)))
+            self.state_calls.append(
+                {
+                    "action": action,
+                    "target": str(target),
+                    "kwargs": kwargs,
+                }
+            )
             return {"ok": True, "action": action, "target": str(target)}
 
         return handler
@@ -118,7 +133,44 @@ class AthenaServerTest(unittest.TestCase):
                 "INSERT OR REPLACE INTO chat_state (channel, chat_id, current_task_id, last_user_intent, last_progress, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
                 ("telegram", "1937792843", "task-1", "status check", "Phase 4 done", now),
             )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO outbox_items (
+                  id, task_id, project_id, provider, account_label, to_recipients, subject, body_text, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "outbox-1",
+                    "task-1",
+                    "project-1",
+                    "gmail",
+                    "primary",
+                    "person@example.com",
+                    "Board approval",
+                    "Draft body",
+                    "needs_approval",
+                    now,
+                    now,
+                ),
+            )
             conn.commit()
+
+    def _start_server(self):
+        try:
+            httpd = self.server_module.create_server("127.0.0.1", 0, paths=self.paths)
+        except PermissionError:
+            self.skipTest("socket bind not permitted in this environment")
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        port = httpd.server_address[1]
+        base = f"http://127.0.0.1:{port}"
+        return httpd, thread, base
+
+    def _post_json(self, url: str, data: dict[str, object]) -> dict[str, object]:
+        encoded = urllib.parse.urlencode(data, doseq=True).encode("utf-8")
+        request = urllib.request.Request(url, data=encoded, method="POST")
+        with urllib.request.urlopen(request) as response:
+            return json.loads(response.read().decode("utf-8"))
 
     def test_gather_data_includes_sections(self):
         data = self.server_module._gather_data(self.paths)
@@ -138,15 +190,7 @@ class AthenaServerTest(unittest.TestCase):
         self.assertIn("Quick Capture", html_blob)
 
     def test_api_endpoints_return_expected_payloads(self):
-        try:
-            httpd = self.server_module.create_server("127.0.0.1", 0, paths=self.paths)
-        except PermissionError:
-            self.skipTest("socket bind not permitted in this environment")
-        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-        thread.start()
-        port = httpd.server_address[1]
-        base = f"http://127.0.0.1:{port}"
-
+        httpd, thread, base = self._start_server()
         try:
             tasks = json.loads(urllib.request.urlopen(f"{base}/api/tasks").read().decode("utf-8"))
             self.assertTrue(any(row["id"] == "task-1" for row in tasks))
@@ -157,9 +201,68 @@ class AthenaServerTest(unittest.TestCase):
             kanban = json.loads(urllib.request.urlopen(f"{base}/api/kanban").read().decode("utf-8"))
             self.assertIn("ATHENA", kanban)
 
+            outbox = json.loads(urllib.request.urlopen(f"{base}/api/outbox").read().decode("utf-8"))
+            self.assertTrue(any(row["id"] == "outbox-1" for row in outbox))
+
             health = json.loads(urllib.request.urlopen(f"{base}/api/health").read().decode("utf-8"))
             self.assertTrue(health["ok"])
             self.assertTrue(str(health["db"]).endswith("tasks.sqlite"))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
+
+    def test_complete_task_api_passes_evidence_and_verifier(self):
+        httpd, thread, base = self._start_server()
+        try:
+            response = self._post_json(
+                f"{base}/api/tasks/task-1/complete",
+                {
+                    "summary": "Shipped board mutation tests.",
+                    "evidence": "pytest tests/test_server.py\nboard api smoke",
+                    "verified_by": "fleire",
+                },
+            )
+            self.assertEqual(response["action"], "complete")
+            call = self.state_calls[-1]
+            self.assertEqual(call["action"], "complete")
+            kwargs = call["kwargs"]
+            self.assertEqual(kwargs["task_id"], "task-1")
+            self.assertEqual(kwargs["summary"], "Shipped board mutation tests.")
+            self.assertEqual(kwargs["evidence"], ["pytest tests/test_server.py", "board api smoke"])
+            self.assertEqual(kwargs["verified_by"], "fleire")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
+
+    def test_outbox_batch_api_supports_approve_and_send(self):
+        httpd, thread, base = self._start_server()
+        try:
+            approve = self._post_json(
+                f"{base}/api/outbox/batch",
+                {
+                    "action": "approve",
+                    "outbox_id": ["outbox-1", "outbox-2"],
+                    "note": "Batch approved",
+                },
+            )
+            self.assertEqual(approve["action"], "outbox-approve")
+            approve_call = self.state_calls[-1]
+            self.assertEqual(approve_call["action"], "outbox-approve")
+            self.assertEqual(approve_call["kwargs"]["outbox_ids"], ["outbox-1", "outbox-2"])
+
+            send = self._post_json(
+                f"{base}/api/outbox/batch",
+                {
+                    "action": "send",
+                    "outbox_id": ["outbox-1"],
+                },
+            )
+            self.assertEqual(send["action"], "outbox-send")
+            send_call = self.state_calls[-1]
+            self.assertEqual(send_call["action"], "outbox-send")
+            self.assertEqual(send_call["kwargs"]["outbox_ids"], ["outbox-1"])
         finally:
             httpd.shutdown()
             httpd.server_close()

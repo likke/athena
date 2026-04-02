@@ -223,6 +223,28 @@ class StateLayerTests(unittest.TestCase):
         self.assertIsNone(reopened["completion_summary"])
         self.assertEqual(reopened["reopen_reason"], "Need to patch edge cases in CLI output handling.")
 
+    def test_task_completion_requires_evidence(self) -> None:
+        task = create_task(
+            title="Require proof for completion",
+            owner="ATHENA",
+            db_path=self.db_path,
+            project_id="project-1",
+            portfolio_id="portfolio-1",
+            source_channel="telegram",
+            source_chat_id="1937792843",
+            dedupe_key="task:require-proof",
+            actor="test",
+        )
+
+        with self.assertRaises(StateTransitionError):
+            complete_task(
+                task_id=str(task["id"]),
+                db_path=self.db_path,
+                summary="Marked done without evidence.",
+                evidence=[],
+                actor="test",
+            )
+
     def test_project_completion_requires_summary(self) -> None:
         with self.assertRaises(StateTransitionError):
             update_project_status(

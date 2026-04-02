@@ -33,6 +33,20 @@ except ImportError:  # pragma: no cover - best effort during bootstrap
 
     state_module = _StateStub()
 
+try:
+    from . import outbox as outbox_module
+except ImportError:  # pragma: no cover - best effort during bootstrap
+    class _OutboxStub:
+        def _missing(self, *args, **kwargs):
+            raise NotImplementedError("outbox module not implemented")
+
+        create_email_outbox = _missing
+        approve_outbox_items = _missing
+        reject_outbox_items = _missing
+        send_outbox_items = _missing
+
+    outbox_module = _OutboxStub()
+
 
 def _pht(ts: int | None) -> str:
     if not ts:
@@ -292,6 +306,48 @@ def _closed_task_data(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     )
 
 
+def _outbox_data(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    return query_all(
+        conn,
+        """
+        SELECT
+          o.id,
+          o.task_id,
+          o.project_id,
+          o.account_label,
+          o.to_recipients,
+          o.cc_recipients,
+          o.subject,
+          o.body_text,
+          o.status,
+          o.draft_id,
+          o.external_ref,
+          o.external_url,
+          o.approval_note,
+          o.error_message,
+          o.sent_at,
+          o.updated_at,
+          COALESCE(t.title, '') AS task_title,
+          COALESCE(p.name, '') AS project_name
+        FROM outbox_items o
+        LEFT JOIN tasks t ON t.id = o.task_id
+        LEFT JOIN projects p ON p.id = o.project_id
+        ORDER BY
+          CASE o.status
+            WHEN 'needs_approval' THEN 0
+            WHEN 'approved' THEN 1
+            WHEN 'drafting' THEN 2
+            WHEN 'sending' THEN 3
+            WHEN 'error' THEN 4
+            WHEN 'sent' THEN 5
+            ELSE 6
+          END,
+          o.updated_at DESC
+        LIMIT 30
+        """,
+    )
+
+
 def _gather_data(paths: AthenaPaths) -> dict[str, Any]:
     ensure_db(paths=paths)
     with connect_db(paths.db_path) as conn:
@@ -301,6 +357,7 @@ def _gather_data(paths: AthenaPaths) -> dict[str, Any]:
             "inbox": _capture_data(conn),
             "kanban": _kanban_data(conn),
             "closed_tasks": _closed_task_data(conn),
+            "outbox": _outbox_data(conn),
             "projects": _project_data(conn),
             "repos": _repo_data(conn),
             "tasks": _task_data(conn),
@@ -333,6 +390,8 @@ def _build_stat_grid(counts: dict[str, Any]) -> str:
         ("closed_tasks", "Closed"),
         ("new_items", "Inbox new"),
         ("triaged_items", "Inbox triaged"),
+        ("outbox_needs_approval", "Needs approval"),
+        ("outbox_approved", "Approved send"),
     ]
     cards = []
     for key, title in labels:
@@ -350,6 +409,7 @@ def _build_stat_grid(counts: dict[str, Any]) -> str:
 def _render_sync_controls() -> str:
     actions = [
         ("all", "Sync all context"),
+        ("google", "Sync Google"),
         ("life", "Sync life"),
         ("repos", "Scan repos"),
         ("briefs", "Refresh briefs"),
@@ -425,7 +485,11 @@ def _build_complete_form(task_id: str, summary: str) -> str:
         f"""
         <label class="control-label">Completion note</label>
         <input type="text" name="summary" value="{html.escape(summary)}" placeholder="What shipped or was decided?" required>
-        <p class="control-desc muted">Completion always records evidence.</p>
+        <label class="control-label">Evidence</label>
+        <textarea name="evidence" rows="3" placeholder="One proof point per line: PR, screenshot, test run, doc, or shipped URL." required></textarea>
+        <label class="control-label">Verified by</label>
+        <input type="text" name="verified_by" placeholder="Optional verifier">
+        <p class="control-desc muted">Tasks only close with evidence. One line per proof item.</p>
         """,
     )
 
@@ -648,9 +712,107 @@ def _render_project_control(projects: list[dict[str, Any]]) -> str:
     """
 
 
+def _render_outbox_compose_form(project_options: str) -> str:
+    return f"""
+    <form class="capture-form" method="post" action="/outbox/new">
+      <div class="form-grid">
+        <select name="project_id">{project_options}</select>
+        <input type="text" name="task_id" placeholder="Optional task id">
+      </div>
+      <div class="form-grid">
+        <input type="text" name="to_recipients" placeholder="To: comma-separated emails" required>
+        <input type="text" name="cc_recipients" placeholder="CC: optional">
+      </div>
+      <input type="text" name="subject" placeholder="Email subject" required>
+      <textarea name="body_text" rows="5" placeholder="Draft the email Athena should queue for approval..." required></textarea>
+      <button type="submit">Create Gmail draft</button>
+    </form>
+    """
+
+
+def _render_outbox_card(item: dict[str, Any]) -> str:
+    badges = _render_trello_badges(
+        ("capture", str(item.get("status") or "")),
+        ("project", str(item.get("project_name") or item.get("task_title") or "")),
+    )
+    body_preview = str(item.get("body_text") or "").strip()
+    if len(body_preview) > 220:
+        body_preview = f"{body_preview[:217]}..."
+    details: list[str] = []
+    if item.get("to_recipients"):
+        details.append(f"To: {item['to_recipients']}")
+    if item.get("cc_recipients"):
+        details.append(f"Cc: {item['cc_recipients']}")
+    if item.get("draft_id"):
+        details.append(f"Draft: {item['draft_id']}")
+    if item.get("error_message"):
+        details.append(f"Error: {item['error_message']}")
+    if item.get("approval_note"):
+        details.append(f"Note: {item['approval_note']}")
+    detail_html = "".join(f'<p class="kanban-copy muted">{html.escape(line)}</p>' for line in details)
+    external_link = ""
+    if item.get("external_url"):
+        external_link = f'<p class="kanban-copy muted"><a href="{html.escape(str(item["external_url"]))}" target="_blank" rel="noreferrer">Open in Gmail</a></p>'
+    return f"""
+    <article class="kanban-card trello-card">
+      <label class="outbox-select">
+        <input type="checkbox" name="outbox_id" value="{html.escape(str(item['id']))}">
+        Select
+      </label>
+      <div class="trello-badges">{badges}</div>
+      <div class="kanban-title trello-title">{html.escape(str(item.get('subject') or 'Email draft'))}</div>
+      <p class="kanban-copy trello-copy">{html.escape(body_preview or 'No body yet.')}</p>
+      {detail_html}
+      {external_link}
+    </article>
+    """
+
+
+def _render_outbox_panel(items: list[dict[str, Any]]) -> str:
+    if not items:
+        return '<p class="muted">No email approvals queued.</p>'
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        groups.setdefault(str(item.get("status") or "unknown"), []).append(item)
+    columns: list[str] = []
+    for status in ("needs_approval", "approved", "sending", "error", "sent", "rejected"):
+        rows = groups.get(status, [])
+        if not rows:
+            continue
+        cards = "".join(_render_outbox_card(item) for item in rows)
+        columns.append(
+            f"""
+            <section class="kanban-column trello-list">
+              <div class="trello-list-header">
+                <h3>{html.escape(status.replace('_', ' ').title())}</h3>
+                <span class="trello-list-count">{len(rows)}</span>
+              </div>
+              <div class="trello-list-body">{cards}</div>
+            </section>
+            """
+        )
+    controls = """
+    <div class="panel-actions">
+      <button type="submit" name="action" value="approve">Approve selected</button>
+      <button type="submit" name="action" value="reject">Reject selected</button>
+      <button type="submit" name="action" value="send">Send approved / selected</button>
+      <input type="text" name="note" placeholder="Optional approval note">
+    </div>
+    """
+    return f"""
+    <form class="outbox-batch-form" method="post" action="/outbox/batch">
+      <div class="trello-board outbox-board">
+        {"".join(columns)}
+      </div>
+      {controls}
+    </form>
+    """
+
+
 def _render_html(data: dict[str, Any], banner_message: str | None = None, banner_kind: str = "ok") -> str:
     raw_counts = data["dashboard"].get("counts", {})
     inbox_counts = data["dashboard"].get("inbox", {})
+    outbox_counts = data["dashboard"].get("outbox", {})
     stats_html = _build_stat_grid(
         {
             "open_tasks": raw_counts.get("open_tasks", 0),
@@ -660,6 +822,8 @@ def _render_html(data: dict[str, Any], banner_message: str | None = None, banner
             "closed_tasks": raw_counts.get("closed_tasks", len(data.get("closed_tasks", []))),
             "new_items": inbox_counts.get("new_items", 0),
             "triaged_items": inbox_counts.get("triaged_items", 0),
+            "outbox_needs_approval": outbox_counts.get("outbox_needs_approval", 0),
+            "outbox_approved": outbox_counts.get("outbox_approved", 0),
         }
     )
     sync_controls = _render_sync_controls()
@@ -673,9 +837,11 @@ def _render_html(data: dict[str, Any], banner_message: str | None = None, banner
     )
     quick_capture_html = _render_quick_capture_form()
     project_control_html = _render_project_control(data.get("projects", []))
+    outbox_compose_html = _render_outbox_compose_form(project_options)
+    outbox_html = _render_outbox_panel(data.get("outbox", []))
     life_parts = _render_items(data["life"]["areas"], ["name", "status", "priority", "notes"])
     life_goals = _render_items(data["life"]["goals"], ["title", "status", "horizon", "current_focus"])
-    life_people = _render_items(data["life"]["people"], ["name", "relationship_type", "importance_score"])
+    life_people = _render_items(data["life"]["people"], ["name", "relationship_type", "importance_score", "contact_rule"])
     project_rows = _render_items(
         data["projects"],
         [
@@ -751,6 +917,12 @@ def _render_html(data: dict[str, Any], banner_message: str | None = None, banner
       <section class="panel">
         <h2>Quick Capture</h2>
         {quick_capture_html}
+      </section>
+      <section class="panel">
+        <h2>Email Outbox</h2>
+        <p>Queue Gmail drafts, approve several at once, and send only what is explicitly approved.</p>
+        {outbox_compose_html}
+        {outbox_html}
       </section>
       <section class="panel">
         <h2>Portfolios & Projects</h2>
@@ -835,6 +1007,12 @@ class AthenaHandler(BaseHTTPRequestHandler):
         parsed = parse_qs(body, keep_blank_values=True)
         return {key: values[-1] for key, values in parsed.items()}
 
+    def _read_form_multimap(self) -> dict[str, list[str]]:
+        raw_length = self.headers.get("Content-Length", "0")
+        length = int(raw_length or "0")
+        body = self.rfile.read(length).decode("utf-8") if length > 0 else ""
+        return parse_qs(body, keep_blank_values=True)
+
     def _redirect_home(self, notice: str, kind: str = "ok") -> None:
         query = urlencode({"notice": notice, "kind": kind})
         self.send_response(HTTPStatus.SEE_OTHER)
@@ -847,8 +1025,13 @@ class AthenaHandler(BaseHTTPRequestHandler):
         stripped = value.strip()
         return stripped or None
 
+    def _evidence_items(self, value: str | None) -> list[str]:
+        if value is None:
+            return []
+        return [line.strip() for line in value.splitlines() if line.strip()]
+
     def _run_sync_command(self, paths: AthenaPaths, command: str, *, as_json: bool) -> None:
-        if command not in {"all", "life", "repos", "briefs"}:
+        if command not in {"all", "google", "life", "repos", "briefs"}:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         summary = run_sync(command, paths=paths)
@@ -889,11 +1072,14 @@ class AthenaHandler(BaseHTTPRequestHandler):
             summary = self._optional(params.get("summary"))
             if summary is None:
                 raise ValueError("summary is required")
+            evidence = self._evidence_items(params.get("evidence"))
             return state_module.complete_task(
                 task_id=task_id,
                 db_path=paths.db_path,
                 actor=actor,
                 summary=summary,
+                evidence=evidence,
+                verified_by=self._optional(params.get("verified_by")),
                 note=self._optional(params.get("note")),
             )
         if action == "reopen":
@@ -973,6 +1159,51 @@ class AthenaHandler(BaseHTTPRequestHandler):
             completion_summary=self._optional(params.get("completion_summary")),
         )
 
+    def _handle_new_outbox(self, paths: AthenaPaths, params: dict[str, str]) -> dict[str, Any]:
+        to_recipients = self._optional(params.get("to_recipients"))
+        subject = self._optional(params.get("subject"))
+        body_text = self._optional(params.get("body_text"))
+        if to_recipients is None or subject is None or body_text is None:
+            raise ValueError("to_recipients, subject, and body_text are required")
+        return outbox_module.create_email_outbox(
+            db_path=paths.db_path,
+            paths=paths,
+            to_recipients=to_recipients,
+            cc_recipients=self._optional(params.get("cc_recipients")),
+            task_id=self._optional(params.get("task_id")),
+            project_id=self._optional(params.get("project_id")),
+            subject=subject,
+            body_text=body_text,
+            actor="board",
+        )
+
+    def _handle_outbox_batch(self, paths: AthenaPaths, params: dict[str, list[str]]) -> dict[str, Any]:
+        action = (params.get("action") or [""])[-1].strip()
+        note = self._optional((params.get("note") or [""])[-1])
+        outbox_ids = [item.strip() for item in params.get("outbox_id", []) if item.strip()]
+        if action == "approve":
+            return outbox_module.approve_outbox_items(
+                db_path=paths.db_path,
+                outbox_ids=outbox_ids,
+                actor="board",
+                note=note,
+            )
+        if action == "reject":
+            return outbox_module.reject_outbox_items(
+                db_path=paths.db_path,
+                outbox_ids=outbox_ids,
+                actor="board",
+                note=note,
+            )
+        if action == "send":
+            return outbox_module.send_outbox_items(
+                db_path=paths.db_path,
+                paths=paths,
+                outbox_ids=outbox_ids or None,
+                actor="board",
+            )
+        raise ValueError("action must be one of approve, reject, or send")
+
     def do_GET(self) -> None:
         paths = self.server.athena_state.paths  # type: ignore[attr-defined]
         parsed = urlsplit(self.path)
@@ -1007,6 +1238,8 @@ class AthenaHandler(BaseHTTPRequestHandler):
                 _json_response(self, data["kanban"])
             elif endpoint == "closed-tasks":
                 _json_response(self, data["closed_tasks"])
+            elif endpoint == "outbox":
+                _json_response(self, data["outbox"])
             elif endpoint == "chat":
                 _json_response(self, data["chat"])
             elif endpoint == "health":
@@ -1045,10 +1278,43 @@ class AthenaHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._redirect_home(f"Project update failed: {exc}", kind="error")
             return
+        if route == "/outbox/new":
+            params = self._read_form()
+            try:
+                self._handle_new_outbox(paths, params)
+                self._redirect_home("Draft queued for approval")
+            except Exception as exc:
+                self._redirect_home(f"Outbox draft failed: {exc}", kind="error")
+            return
         if route.startswith("/api/projects/update"):
             params = self._read_form()
             try:
                 _json_response(self, self._handle_project_update(paths, params))
+            except Exception as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if route == "/outbox/batch":
+            params = self._read_form_multimap()
+            try:
+                result = self._handle_outbox_batch(paths, params)
+                notice = "Outbox updated"
+                if result.get("sent_count"):
+                    notice = f"Sent {result['sent_count']} email(s)"
+                self._redirect_home(notice)
+            except Exception as exc:
+                self._redirect_home(f"Outbox action failed: {exc}", kind="error")
+            return
+        if route == "/api/outbox/new":
+            params = self._read_form()
+            try:
+                _json_response(self, self._handle_new_outbox(paths, params))
+            except Exception as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if route == "/api/outbox/batch":
+            params = self._read_form_multimap()
+            try:
+                _json_response(self, self._handle_outbox_batch(paths, params))
             except Exception as exc:
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
             return

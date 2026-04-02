@@ -155,6 +155,31 @@ main {
 
 .panel-actions {
   font-size: 0.8rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.panel-actions button,
+.panel-actions input {
+  border-radius: 999px;
+}
+
+.panel-actions button {
+  border: none;
+  padding: 0.45rem 0.8rem;
+  background: rgba(244, 180, 0, 0.9);
+  color: #111827;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.panel-actions input {
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  padding: 0.45rem 0.8rem;
 }
 
 .trello-board {
@@ -451,6 +476,23 @@ main {
   color: #12131c;
   font-weight: 700;
   cursor: pointer;
+}
+
+.outbox-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: #475569;
+}
+
+.outbox-select input {
+  accent-color: #f59e0b;
+}
+
+.outbox-board .trello-list {
+  min-width: 280px;
 }
 
 .form-grid {
