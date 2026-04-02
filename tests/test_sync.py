@@ -46,6 +46,28 @@ class SyncTestCase(unittest.TestCase):
             (notebook_dir / "notebook-note.md").write_text("Notebook insight.")
 
             with connect_db(paths.db_path) as conn:
+                now = now_ts()
+                conn.execute(
+                    """
+                    INSERT INTO source_documents (
+                      id, kind, title, path, external_url, source_system, is_authoritative,
+                      last_synced_at, summary, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "doc_north_star",
+                        "life_doc",
+                        "North Star",
+                        str(north),
+                        None,
+                        "local_markdown",
+                        1,
+                        now,
+                        "Old summary",
+                        now,
+                        now,
+                    ),
+                )
                 docs = sync_life_docs(conn, paths.life_dir)
                 notebooks = sync_notebooklm_exports(conn, notebook_dir)
                 conn.commit()
@@ -53,11 +75,16 @@ class SyncTestCase(unittest.TestCase):
             self.assertCountEqual(docs, ["CURRENT_SEASON.md", "NORTH_STAR.md"])
             self.assertEqual(notebooks, ["notebook-note.md"])
             with connect_db(paths.db_path) as conn:
-                rows = list(conn.execute("SELECT id, is_authoritative, kind FROM source_documents"))
+                rows = list(conn.execute("SELECT id, is_authoritative, kind, source_system FROM source_documents"))
                 self.assertEqual(len(rows), 3)
                 authoritative = [row for row in rows if row["is_authoritative"]]
                 self.assertEqual(len(authoritative), 2)
                 self.assertTrue(all(row["kind"] == "life_doc" for row in authoritative))
+                self.assertIn("doc_north_star", [row["id"] for row in rows])
+                north_row = conn.execute("SELECT source_system FROM source_documents WHERE id = 'doc_north_star'").fetchone()
+                self.assertEqual(north_row["source_system"], "life-doc")
+                north_summary = conn.execute("SELECT summary FROM source_documents WHERE id = 'doc_north_star'").fetchone()
+                self.assertEqual(north_summary["summary"], "Be clear.")
                 self.assertEqual([row["kind"] for row in rows if not row["is_authoritative"]], ["notebooklm"])
 
     def test_scan_project_repos_updates_projects(self):

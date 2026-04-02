@@ -46,15 +46,38 @@ def _ensure_dir(path: Path) -> Path:
 
 
 def _text_summary(content: str) -> str:
+    fallback = ""
     for line in content.splitlines():
         clean = line.strip()
+        if not clean or clean == "---":
+            continue
+        if clean.startswith("#"):
+            if not fallback:
+                fallback = clean.lstrip("#").strip()
+            continue
+        if clean.startswith("- "):
+            return clean[2:].strip()
         if clean:
             return clean
-    return ""
+    return fallback
 
 
 def _title_from_path(path: Path) -> str:
     return path.stem.replace("_", " ").replace("-", " ").title()
+
+
+def _path_variants(path: Path) -> tuple[str, ...]:
+    variants = {
+        str(path),
+        str(path.expanduser()),
+        str(path.expanduser().resolve()),
+    }
+    for candidate in list(variants):
+        if candidate.startswith("/private/var/"):
+            variants.add(candidate.removeprefix("/private"))
+        elif candidate.startswith("/var/"):
+            variants.add(f"/private{candidate}")
+    return tuple(sorted(variants))
 
 
 def _upsert_source_document(
@@ -69,6 +92,7 @@ def _upsert_source_document(
     external_url: str | None = None,
 ) -> None:
     now = now_ts()
+    normalized_path = path.expanduser().resolve()
     conn.execute(
         """
         INSERT INTO source_documents (id, kind, title, path, external_url, source_system, is_authoritative, last_synced_at, summary, created_at, updated_at)
@@ -88,7 +112,7 @@ def _upsert_source_document(
             doc_id,
             kind,
             title,
-            str(path),
+            str(normalized_path),
             external_url,
             source_system,
             int(is_authoritative),
@@ -100,6 +124,40 @@ def _upsert_source_document(
     )
 
 
+def _choose_document_id(conn, path: Path, default_id: str) -> str:
+    variants = _path_variants(path)
+    placeholders = ", ".join(["?"] * len(variants))
+    existing = query_one(
+        conn,
+        f"""
+        SELECT id
+        FROM source_documents
+        WHERE path IN ({placeholders})
+        ORDER BY
+          CASE source_system
+            WHEN 'life-doc' THEN 0
+            WHEN 'local_markdown' THEN 1
+            WHEN 'NotebookLM' THEN 2
+            ELSE 3
+          END,
+          updated_at DESC,
+          created_at DESC
+        LIMIT 1
+        """,
+        variants,
+    )
+    return str(existing["id"]) if existing else default_id
+
+
+def _dedupe_source_documents(conn, path: Path, keep_id: str) -> None:
+    variants = _path_variants(path)
+    placeholders = ", ".join(["?"] * len(variants))
+    conn.execute(
+        f"DELETE FROM source_documents WHERE path IN ({placeholders}) AND id != ?",
+        (*variants, keep_id),
+    )
+
+
 def sync_life_docs(conn, life_dir: Path) -> list[str]:
     life_dir = _ensure_dir(life_dir)
     processed: list[str] = []
@@ -108,7 +166,7 @@ def sync_life_docs(conn, life_dir: Path) -> list[str]:
             continue
         title = _title_from_path(entry)
         summary = _text_summary(entry.read_text(encoding="utf-8"))
-        doc_id = f"life-{slugify(entry.stem)}"
+        doc_id = _choose_document_id(conn, entry, f"life-{slugify(entry.stem)}")
         _upsert_source_document(
             conn,
             doc_id=doc_id,
@@ -119,6 +177,7 @@ def sync_life_docs(conn, life_dir: Path) -> list[str]:
             is_authoritative=True,
             summary=summary,
         )
+        _dedupe_source_documents(conn, entry, doc_id)
         processed.append(entry.name)
     return processed
 
@@ -133,7 +192,7 @@ def sync_notebooklm_exports(conn, notebook_dir: Path) -> list[str]:
             continue
         title = _title_from_path(entry)
         summary = _text_summary(entry.read_text(encoding="utf-8"))
-        doc_id = f"notebooklm-{slugify(entry.stem)}"
+        doc_id = _choose_document_id(conn, entry, f"notebooklm-{slugify(entry.stem)}")
         _upsert_source_document(
             conn,
             doc_id=doc_id,
@@ -144,6 +203,7 @@ def sync_notebooklm_exports(conn, notebook_dir: Path) -> list[str]:
             is_authoritative=False,
             summary=summary,
         )
+        _dedupe_source_documents(conn, entry, doc_id)
         processed.append(entry.name)
     return processed
 
