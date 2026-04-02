@@ -7,7 +7,7 @@ It keeps three layers in one place:
 - life context
 - portfolio and project status
 - execution truth
-- Google-aware mirrors for Gmail, Calendar, Contacts, Drive, and NotebookLM exports
+- Google-aware mirrors for Gmail, Calendar, Drive, and NotebookLM exports
 - Gmail draft approval and send tracking through a local outbox queue
 
 The app is designed to work against the same SQLite database already used by the live OpenClaw/Athena task-routing flow, so Telegram can keep using the current runtime while the board, sync jobs, and repo/project status live in a real codebase.
@@ -18,7 +18,7 @@ The app is designed to work against the same SQLite database already used by the
 - `athena.outbox`: Gmail draft, approval, reject, and send state
 - `athena.render_markdown`: generated compatibility views for Telegram bucket files
 - `athena.sync`: life-doc, awareness-brief, and repo-status sync commands
-- `athena.google`: local Google OAuth and Gmail / Calendar / Contacts / Drive / NotebookLM helpers
+- `athena.google`: local Google OAuth and Gmail / Calendar / Drive / NotebookLM helpers
 - `athena.server`: local HTTP dashboard / board with batch email approvals
 
 ## Default Data Paths
@@ -78,10 +78,19 @@ By default Athena now requests the `athena-google-full` profile, which includes:
 - Docs
 - Sheets
 - Calendar
-- Contacts read-only
 - basic Google identity scopes
 
 If you want a narrower setup, change the `oauth.profile` value in `settings.json`.
+
+If you do not want live contacts right now, set:
+
+```json
+{
+  "contacts": {
+    "enabled": false
+  }
+}
+```
 
 The default settings template sets `"include_granted_scopes": false` so Athena asks only for the scopes you requested, instead of inheriting unrelated scopes from older consent history on the same Google OAuth client.
 
@@ -137,9 +146,9 @@ If Google sync reports a `calendar_error` with `accessNotConfigured`, the Google
 
 - Gmail inbox messages into `~/.openclaw/workspace/system/google-mirror/gmail/`
 - upcoming calendar agenda and events into `~/.openclaw/workspace/system/google-mirror/calendar/`
-- Google contacts into `~/.openclaw/workspace/system/google-mirror/contacts/`
 - text-capable Drive files into `~/.openclaw/workspace/system/google-mirror/drive/`
 - NotebookLM export files from a Drive folder into `~/.openclaw/workspace/life/notebooklm-exports/`
+- a generated `ATHENA_LIFE_CONTEXT_BUNDLE.md` into `~/.openclaw/workspace/life/notebooklm-exports/` when that folder would otherwise be empty
 
 The important rule is: NotebookLM is not the source of truth. Athena mirrors the useful parts into local files and then ingests those into the normal `source_documents` layer.
 

@@ -9,6 +9,8 @@ from pathlib import Path
 from athena.config import default_paths
 from athena.db import connect_db, ensure_db, now_ts
 from athena.sync import (
+    NOTEBOOKLM_LIFE_BUNDLE,
+    ensure_notebooklm_life_bundle,
     refresh_awareness_briefs,
     run_sync,
     scan_project_repos,
@@ -92,6 +94,26 @@ class SyncTestCase(unittest.TestCase):
                 north_summary = conn.execute("SELECT summary FROM source_documents WHERE id = 'doc_north_star'").fetchone()
                 self.assertEqual(north_summary["summary"], "Be clear.")
                 self.assertEqual([row["kind"] for row in rows if not row["is_authoritative"]], ["notebooklm"])
+
+    def test_ensure_notebooklm_life_bundle_generates_bundle_from_life_docs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            paths = _test_paths(tmp)
+            paths.life_dir.mkdir(parents=True, exist_ok=True)
+            (paths.life_dir / "NORTH_STAR.md").write_text("# North Star\nProtect focus.", encoding="utf-8")
+            (paths.life_dir / "CURRENT_SEASON.md").write_text("Builder season.", encoding="utf-8")
+
+            bundle = ensure_notebooklm_life_bundle(paths.life_dir, paths.notebooklm_export_dir)
+
+            self.assertIsNotNone(bundle)
+            assert bundle is not None
+            self.assertEqual(bundle.name, NOTEBOOKLM_LIFE_BUNDLE)
+            content = bundle.read_text(encoding="utf-8")
+            self.assertIn("Athena Life Context Bundle", content)
+            self.assertIn("North Star", content)
+            self.assertIn("Protect focus.", content)
+            self.assertIn("Current Season", content)
+            self.assertIn("Builder season.", content)
 
     def test_scan_project_repos_updates_projects(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -188,6 +210,31 @@ class SyncTestCase(unittest.TestCase):
                 self.assertEqual(row["source_system"], "NotebookLM")
                 self.assertEqual(row["kind"], "notebooklm")
                 self.assertEqual(row["summary"], "Life update from mirrored export.")
+
+    def test_run_sync_google_seeds_life_bundle_when_notebook_exports_are_empty(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            paths = _test_paths(tmp)
+            ensure_db(paths=paths)
+            paths.life_dir.mkdir(parents=True, exist_ok=True)
+            (paths.life_dir / "NORTH_STAR.md").write_text("# North Star\nKeep the main thing the main thing.", encoding="utf-8")
+
+            result = run_sync("google", paths=paths)
+
+            self.assertEqual(result["command"], "google")
+            self.assertEqual(result["notebook_exports"], 1)
+            bundle = paths.notebooklm_export_dir / NOTEBOOKLM_LIFE_BUNDLE
+            self.assertTrue(bundle.exists())
+            with connect_db(paths.db_path) as conn:
+                row = conn.execute(
+                    "SELECT source_system, kind, summary FROM source_documents WHERE path = ?",
+                    (str(bundle.resolve()),),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                assert row is not None
+                self.assertEqual(row["source_system"], "NotebookLM")
+                self.assertEqual(row["kind"], "notebooklm")
+                self.assertEqual(row["summary"], "This file is generated from Athena's canonical local life docs.")
 
 
 if __name__ == "__main__":

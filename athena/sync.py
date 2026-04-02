@@ -26,6 +26,8 @@ from .source_docs import (
     upsert_source_document,
 )
 
+NOTEBOOKLM_LIFE_BUNDLE = "ATHENA_LIFE_CONTEXT_BUNDLE.md"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sync Athena life, repo, and awareness sources.")
@@ -78,9 +80,40 @@ def sync_life_docs(conn, life_dir: Path) -> list[str]:
     return processed
 
 
-def sync_notebooklm_exports(conn, notebook_dir: Path) -> list[str]:
-    if not notebook_dir.exists():
-        return []
+def ensure_notebooklm_life_bundle(life_dir: Path, notebook_dir: Path) -> Path | None:
+    life_dir = _ensure_dir(life_dir)
+    notebook_dir = _ensure_dir(notebook_dir)
+    life_docs = iter_text_files(life_dir, suffixes=TEXT_SUFFIXES)
+    if not life_docs:
+        return None
+
+    sections = [
+        "# Athena Life Context Bundle",
+        "",
+        "This file is generated from Athena's canonical local life docs.",
+        "It keeps the NotebookLM context path useful even when no fresh Drive exports are present.",
+        "",
+    ]
+    for entry in life_docs:
+        title = title_from_path(entry)
+        content = entry.read_text(encoding="utf-8").strip()
+        sections.extend(
+            [
+                f"## {title}",
+                "",
+                content or "(empty)",
+                "",
+            ]
+        )
+    bundle_path = notebook_dir / NOTEBOOKLM_LIFE_BUNDLE
+    bundle_path.write_text("\n".join(sections).strip() + "\n", encoding="utf-8")
+    return bundle_path
+
+
+def sync_notebooklm_exports(conn, notebook_dir: Path, *, life_dir: Path | None = None) -> list[str]:
+    notebook_dir = _ensure_dir(notebook_dir)
+    if life_dir is not None:
+        ensure_notebooklm_life_bundle(life_dir, notebook_dir)
     notebook_dir = notebook_dir.expanduser().resolve()
     processed: list[str] = []
     for entry in iter_text_files(notebook_dir, suffixes=TEXT_SUFFIXES):
@@ -258,11 +291,19 @@ def run_sync(
                 }
             summary.update(google_summary)
             if command == "google":
-                mirrored_notebook = sync_notebooklm_exports(conn, resolved_notebook_dir)
+                mirrored_notebook = sync_notebooklm_exports(
+                    conn,
+                    resolved_notebook_dir,
+                    life_dir=resolved_life_dir,
+                )
                 summary["notebook_exports"] = len(mirrored_notebook)
         if command in ("life", "all"):
             processed = sync_life_docs(conn, resolved_life_dir)
-            notebook = sync_notebooklm_exports(conn, resolved_notebook_dir)
+            notebook = sync_notebooklm_exports(
+                conn,
+                resolved_notebook_dir,
+                life_dir=resolved_life_dir,
+            )
             summary["life_docs"] = len(processed)
             summary["notebook_exports"] = len(notebook)
         if command in ("repos", "all"):
