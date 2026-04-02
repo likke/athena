@@ -4,6 +4,7 @@ import base64
 import json
 import tempfile
 import unittest
+import urllib.parse
 from dataclasses import replace
 from pathlib import Path
 
@@ -91,6 +92,8 @@ class GoogleTestCase(unittest.TestCase):
             self.assertIn("accounts.example.com", auth["auth_url"])
             self.assertEqual(auth["scopes"], [GMAIL_READONLY_SCOPE])
             self.assertTrue((paths.google_dir / "oauth-session.json").exists())
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(auth["auth_url"]).query)
+            self.assertEqual(params["include_granted_scopes"], ["false"])
 
             transport = FakeTransport()
             transport.add_json(
@@ -121,6 +124,7 @@ class GoogleTestCase(unittest.TestCase):
                         "oauth": {
                             "profile": "athena-google-full",
                             "scopes": [],
+                            "include_granted_scopes": False,
                         }
                     }
                 ),
@@ -145,8 +149,44 @@ class GoogleTestCase(unittest.TestCase):
 
             status = oauth_status(paths)
             self.assertEqual(status["oauth_profile"], "athena-google-full")
+            self.assertFalse(status["include_granted_scopes"])
             self.assertTrue(status["token_present"])
             self.assertIn(GMAIL_MODIFY_SCOPE, status["granted_scopes"])
+
+    def test_build_auth_url_can_opt_in_to_include_granted_scopes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            paths = _test_paths(tmp)
+            paths.google_dir.mkdir(parents=True, exist_ok=True)
+            paths.google_client_secrets_path.write_text(
+                json.dumps(
+                    {
+                        "installed": {
+                            "client_id": "client-id",
+                            "client_secret": "client-secret",
+                            "auth_uri": "https://accounts.example.com/o/oauth2/v2/auth",
+                            "token_uri": "https://oauth2.example.com/token",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            paths.google_settings_path.write_text(
+                json.dumps(
+                    {
+                        "oauth": {
+                            "profile": "athena-google-full",
+                            "scopes": [],
+                            "include_granted_scopes": True,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            auth = build_auth_url(paths, scopes=("gmail",))
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(auth["auth_url"]).query)
+            self.assertEqual(params["include_granted_scopes"], ["true"])
 
     def test_mirror_google_sources_syncs_gmail_drive_and_notebooklm(self):
         with tempfile.TemporaryDirectory() as tmpdir:

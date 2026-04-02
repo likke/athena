@@ -107,6 +107,7 @@ class DriveFolderSpec:
 class GoogleSyncSettings:
     oauth_profile: str
     oauth_scopes: tuple[str, ...]
+    include_granted_scopes: bool
     gmail: GmailMirrorSettings
     drive_folders: tuple[DriveFolderSpec, ...]
     notebooklm_folder: DriveFolderSpec | None
@@ -215,6 +216,7 @@ def init_settings_template(paths: AthenaPaths | None = None, *, force: bool = Fa
         "oauth": {
             "profile": "athena-google-full",
             "scopes": [],
+            "include_granted_scopes": False,
         },
         "gmail": {
             "enabled": True,
@@ -248,6 +250,7 @@ def load_sync_settings(paths: AthenaPaths | None = None) -> GoogleSyncSettings:
         return GoogleSyncSettings(
             oauth_profile="athena-google-full",
             oauth_scopes=(),
+            include_granted_scopes=False,
             gmail=GmailMirrorSettings(),
             drive_folders=(),
             notebooklm_folder=None,
@@ -257,6 +260,7 @@ def load_sync_settings(paths: AthenaPaths | None = None) -> GoogleSyncSettings:
     oauth = raw.get("oauth") or {}
     oauth_profile = str(oauth.get("profile") or "athena-google-full")
     oauth_scopes = tuple(str(item).strip() for item in (oauth.get("scopes") or []) if str(item).strip())
+    include_granted_scopes = bool(oauth.get("include_granted_scopes", False))
     gmail = raw.get("gmail") or {}
     gmail_settings = GmailMirrorSettings(
         enabled=bool(gmail.get("enabled", False)),
@@ -288,6 +292,7 @@ def load_sync_settings(paths: AthenaPaths | None = None) -> GoogleSyncSettings:
     return GoogleSyncSettings(
         oauth_profile=oauth_profile,
         oauth_scopes=oauth_scopes,
+        include_granted_scopes=include_granted_scopes,
         gmail=gmail_settings,
         drive_folders=tuple(drive_folders),
         notebooklm_folder=notebook_folder,
@@ -313,6 +318,7 @@ def build_auth_url(
     resolved_paths = paths or default_paths()
     client = _load_client_config(resolved_paths)
     normalized_scopes = requested_scopes(resolved_paths, scopes)
+    settings = load_sync_settings(resolved_paths)
     session = {
         "state": secrets.token_urlsafe(24),
         "code_verifier": _code_verifier(),
@@ -325,7 +331,7 @@ def build_auth_url(
         "response_type": "code",
         "scope": " ".join(normalized_scopes),
         "access_type": "offline",
-        "include_granted_scopes": "true",
+        "include_granted_scopes": "true" if settings.include_granted_scopes else "false",
         "prompt": "consent",
         "state": session["state"],
         "code_challenge": _code_challenge(session["code_verifier"]),
@@ -435,6 +441,7 @@ def oauth_status(paths: AthenaPaths | None = None) -> dict[str, Any]:
         "token_present": resolved_paths.google_token_path.exists(),
         "requested_scopes": requested_scopes(resolved_paths),
         "oauth_profile": settings.oauth_profile,
+        "include_granted_scopes": settings.include_granted_scopes,
     }
     if resolved_paths.google_token_path.exists():
         token = _load_token_data(resolved_paths)

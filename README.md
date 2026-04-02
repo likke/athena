@@ -67,7 +67,7 @@ python3 -m athena.google init-settings
 python3 -m athena.google status
 ```
 
-6. Edit `~/.openclaw/workspace/system/google/settings.json` and replace the placeholder folder IDs.
+6. Edit `~/.openclaw/workspace/system/google/settings.json` and replace the placeholder folder IDs. Keep `"include_granted_scopes": false` unless you intentionally want Google to reuse older grants from the same client.
 
 By default Athena now requests the `athena-google-full` profile, which includes:
 
@@ -80,6 +80,8 @@ By default Athena now requests the `athena-google-full` profile, which includes:
 - basic Google identity scopes
 
 If you want a narrower setup, change the `oauth.profile` value in `settings.json`.
+
+The default settings template sets `"include_granted_scopes": false` so Athena asks only for the scopes you requested, instead of inheriting unrelated scopes from older consent history on the same Google OAuth client.
 
 7. Generate the auth URL and local PKCE session:
 
