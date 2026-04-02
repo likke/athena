@@ -275,13 +275,19 @@ def init_settings_template(paths: AthenaPaths | None = None, *, force: bool = Fa
             "enabled": True,
             "query": "in:inbox category:primary newer_than:30d",
             "max_results": 15,
-            "default_account": "athena",
+            "default_account": "primary",
             "accounts": [
+                {
+                    "label": "primary",
+                    "email": "fleire@thirdteam.org",
+                    "display_name": "Fleire",
+                    "default": True,
+                },
                 {
                     "label": "athena",
                     "email": "athena@thirdteam.org",
-                    "display_name": "Athena",
-                    "default": True,
+                    "display_name": "Athena (send-as)",
+                    "default": False,
                 }
             ],
         },

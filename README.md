@@ -187,10 +187,10 @@ Useful commands:
 python3 -m athena.taskctl queue-email --account athena --to "person@example.com" --subject "Follow-up" --body "Draft body"
 python3 -m athena.taskctl approve-outbox outbox-follow-up
 python3 -m athena.taskctl send-outbox
-python3 -m athena.google login --account athena
+python3 -m athena.google status --account primary
 ```
 
-If you configure multiple Gmail identities in `~/.openclaw/workspace/system/google/settings.json`, Athena can keep separate sender labels and optional account-specific token files. The default setup now expects an `athena` sender identity for Athena-owned task mail.
+If you configure multiple Gmail identities in `~/.openclaw/workspace/system/google/settings.json`, Athena can keep separate sender labels and optional account-specific token files. The default setup should use the real primary mailbox for auth and treat `athena@thirdteam.org` as an optional send-as identity unless it is provisioned as a true separate inbox.
 
 ## Goals
 

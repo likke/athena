@@ -19,6 +19,7 @@ from athena.google import (
     build_auth_url,
     create_gmail_draft,
     exchange_code,
+    init_settings_template,
     list_drive_folders,
     mirror_google_sources,
     oauth_status,
@@ -80,6 +81,21 @@ class FakeTransport:
 
 
 class GoogleTestCase(unittest.TestCase):
+    def test_init_settings_template_defaults_to_primary_mailbox(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            paths = _test_paths(tmp)
+
+            settings_path = init_settings_template(paths, force=True)
+            payload = json.loads(settings_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(payload["gmail"]["default_account"], "primary")
+            accounts = {row["label"]: row for row in payload["gmail"]["accounts"]}
+            self.assertTrue(accounts["primary"]["default"])
+            self.assertEqual(accounts["primary"]["email"], "fleire@thirdteam.org")
+            self.assertFalse(accounts["athena"]["default"])
+            self.assertEqual(accounts["athena"]["display_name"], "Athena (send-as)")
+
     def test_build_auth_url_and_exchange_code(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
