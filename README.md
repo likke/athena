@@ -114,6 +114,17 @@ python3 -m athena.sync google
 python3 -m athena.sync all
 ```
 
+12. If you need to discover or verify Drive folder IDs later:
+
+```bash
+python3 -m athena.google list-folders --query "NotebookLM"
+python3 -m athena.google list-folders --query "Athena"
+```
+
+### Gmail troubleshooting
+
+If OAuth succeeds but Gmail requests return `403 accessNotConfigured`, the Google Cloud project behind the Desktop OAuth client has not enabled the Gmail API yet. Enable it in Google Cloud Console for that same project, then retry the sync.
+
 ### What gets mirrored
 
 - Gmail inbox messages into `~/.openclaw/workspace/system/google-mirror/gmail/`

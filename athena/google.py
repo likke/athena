@@ -627,6 +627,39 @@ def _drive_list_folder(
     return list(response.get("files") or [])
 
 
+def list_drive_folders(
+    *,
+    paths: AthenaPaths | None = None,
+    transport: UrlLibTransport | None = None,
+    parent_id: str = "root",
+    query: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    resolved_paths = paths or default_paths()
+    transport = transport or UrlLibTransport()
+    access_token = ensure_access_token(resolved_paths, transport=transport)
+    conditions = [f"'{parent_id}' in parents", "mimeType='application/vnd.google-apps.folder'", "trashed = false"]
+    if query:
+        safe_query = str(query).replace("'", "\\'")
+        conditions.append(f"name contains '{safe_query}'")
+    params = urllib.parse.urlencode(
+        {
+            "q": " and ".join(conditions),
+            "pageSize": limit,
+            "fields": "files(id,name,webViewLink,modifiedTime,parents)",
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true",
+            "orderBy": "modifiedTime desc,name",
+        }
+    )
+    response = transport.request_json(
+        "GET",
+        f"https://www.googleapis.com/drive/v3/files?{params}",
+        headers=_auth_headers(access_token),
+    )
+    return list(response.get("files") or [])
+
+
 def _drive_download_text(
     *,
     file_id: str,
@@ -816,6 +849,11 @@ def parse_args() -> argparse.Namespace:
     exchange_parser = subparsers.add_parser("exchange-code", help="Exchange an OAuth code for local refresh/access tokens.")
     exchange_parser.add_argument("code")
 
+    folders_parser = subparsers.add_parser("list-folders", help="List Drive folders after OAuth is connected.")
+    folders_parser.add_argument("--parent-id", default="root")
+    folders_parser.add_argument("--query", default=None)
+    folders_parser.add_argument("--limit", type=int, default=50)
+
     subparsers.add_parser("status", help="Show local Google OAuth status for Athena.")
     subparsers.add_parser("sync", help="Run the Google mirror pipeline once.")
     return parser.parse_args()
@@ -845,6 +883,16 @@ def main() -> int:
         result = oauth_status(paths)
         for key, value in result.items():
             print(f"{key}: {value}")
+        return 0
+    if args.command == "list-folders":
+        rows = list_drive_folders(
+            paths=paths,
+            parent_id=args.parent_id,
+            query=args.query,
+            limit=args.limit,
+        )
+        for row in rows:
+            print(json.dumps(row, ensure_ascii=True))
         return 0
     if args.command == "sync":
         from .db import connect_db, ensure_db

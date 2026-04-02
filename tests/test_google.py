@@ -16,6 +16,7 @@ from athena.google import (
     DOCS_SCOPE,
     build_auth_url,
     exchange_code,
+    list_drive_folders,
     mirror_google_sources,
     oauth_status,
     requested_scopes,
@@ -267,6 +268,39 @@ class GoogleTestCase(unittest.TestCase):
                 self.assertIn(("gdrive", "drive_file"), source_kinds)
                 self.assertIn(("gdrive", "drive_file_summary"), source_kinds)
                 self.assertIn(("NotebookLM", "notebooklm_export_summary"), source_kinds)
+
+    def test_list_drive_folders_uses_access_token_and_query(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            paths = _test_paths(tmp)
+            paths.google_dir.mkdir(parents=True, exist_ok=True)
+            paths.google_token_path.write_text(
+                json.dumps(
+                    {
+                        "access_token": "cached-access-token",
+                        "refresh_token": "refresh-token",
+                        "expiry": 4102444800,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            transport = FakeTransport()
+            transport.add_json(
+                "drive/v3/files?",
+                {
+                    "files": [
+                        {
+                            "id": "folder-1",
+                            "name": "NotebookLM Exports",
+                            "webViewLink": "https://drive.google.com/drive/folders/folder-1",
+                        }
+                    ]
+                },
+            )
+            rows = list_drive_folders(paths=paths, transport=transport, query="NotebookLM", limit=10)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["id"], "folder-1")
 
 
 if __name__ == "__main__":
