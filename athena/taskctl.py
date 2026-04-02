@@ -30,6 +30,7 @@ from .state import (
     update_project_status,
     complete_task,
 )
+from .transcripts import collect_call_transcripts
 
 DEFAULT_CHANNEL = "telegram"
 DEFAULT_CHAT_ID = "1937792843"
@@ -257,6 +258,12 @@ def parse_args() -> argparse.Namespace:
     gmail_search_parser.add_argument("--query", required=True)
     gmail_search_parser.add_argument("--max-results", type=int, default=10)
     gmail_search_parser.add_argument("--account", default=None)
+
+    transcript_parser = subparsers.add_parser("collect-call-transcripts", parents=[common], help="Collect transcript and recap emails into a single export folder.")
+    transcript_parser.add_argument("--target", action="append", dest="targets", required=True)
+    transcript_parser.add_argument("--destination", default=None)
+    transcript_parser.add_argument("--account", default=None)
+    transcript_parser.add_argument("--max-results-per-query", type=int, default=25)
 
     return parser.parse_args()
 
@@ -999,6 +1006,13 @@ def main() -> int:
                 query=args.query,
                 account_label=args.account,
                 max_results=args.max_results,
+            )
+        elif args.command == "collect-call-transcripts":
+            result = collect_call_transcripts(
+                targets=args.targets,
+                destination=args.destination,
+                account_label=args.account,
+                max_results_per_query=args.max_results_per_query,
             )
         else:
             raise ValueError(f"Unsupported command: {args.command}")
