@@ -134,7 +134,8 @@ class AthenaServerTest(unittest.TestCase):
         self.assertIn("Life context", html_blob)
         self.assertIn("DashoContent", html_blob)
         self.assertIn("Tasks", html_blob)
-        self.assertIn("Capture Inbox", html_blob)
+        self.assertIn("Board", html_blob)
+        self.assertIn("Quick Capture", html_blob)
 
     def test_api_endpoints_return_expected_payloads(self):
         try:

@@ -461,48 +461,23 @@ def _build_task_controls(task: dict[str, Any]) -> str:
     title = str(task.get("title") or task_id)
     next_action = str(task.get("next_action") or "")
     blocker = str(task.get("blocker") or "")
-    return "".join(
+    actions = "".join(
         [
             _build_start_form(task_id, next_action),
             _build_complete_form(task_id, f"Board completion: {title}"),
             _build_block_form(task_id, blocker, next_action),
         ]
     )
+    return f"""
+    <details class="card-actions">
+      <summary>Actions</summary>
+      <div class="kanban-controls">{actions}</div>
+    </details>
+    """
 
 
-def _render_kanban_columns(kanban: dict[str, list[dict[str, Any]]]) -> str:
-    columns = []
-    for bucket in sorted(kanban):
-        cards = []
-        for task in kanban[bucket]:
-            cards.append(
-                f"""
-                <article class="kanban-card">
-                  <header>
-                    <div class="kanban-title">{html.escape(str(task['title']))}</div>
-                    <span class="kanban-meta">{html.escape(str(task.get('project_name') or 'No project'))}</span>
-                  </header>
-                  <p class="kanban-status">{html.escape(str(task.get('status') or ''))}</p>
-                  <p class="kanban-copy">{html.escape(str(task.get('next_action') or ''))}</p>
-                  <p class="kanban-copy muted">{html.escape(str(task.get('blocker') or ''))}</p>
-                  <div class="kanban-controls">{_build_task_controls(task)}</div>
-                </article>
-                """
-            )
-        column_body = "".join(cards) if cards else '<p class="muted">empty</p>'
-        columns.append(
-            f"""
-            <section class="kanban-column">
-              <h3>{html.escape(bucket)}</h3>
-              {column_body}
-            </section>
-            """
-        )
-    return "".join(columns)
-
-
-def _render_capture_panel(inbox: list[dict[str, Any]], project_options: str) -> str:
-    new_capture_form = """
+def _render_quick_capture_form() -> str:
+    return """
     <form class="capture-form" method="post" action="/captures/new">
       <label class="control-label">Capture something Athena should remember</label>
       <textarea name="raw_text" rows="3" placeholder="New task, life update, decision, blocker, or note..." required></textarea>
@@ -513,49 +488,127 @@ def _render_capture_panel(inbox: list[dict[str, Any]], project_options: str) -> 
       <button type="submit">Capture</button>
     </form>
     """
-    rows = []
-    for item in inbox:
-        default_title = (str(item.get("raw_text") or "Captured item").strip().splitlines()[0])[:96]
-        rows.append(
-            f"""
-            <article class="item-card control-card">
-              <div class="item-field"><strong>status:</strong> {html.escape(str(item.get("status") or ""))}</div>
-              <div class="item-field"><strong>classification:</strong> {html.escape(str(item.get("classification") or ""))}</div>
-              <div class="item-field"><strong>raw_text:</strong> {html.escape(str(item.get("raw_text") or ""))}</div>
-              <form class="control-form" method="post" action="/captures/{html.escape(str(item['id']))}/task">
-                <label class="control-label">Task title</label>
-                <input type="text" name="title" value="{html.escape(default_title)}" required>
-                <label class="control-label">Owner</label>
-                <select name="owner">
-                  <option value="ATHENA">ATHENA</option>
-                  <option value="FLEIRE">FLEIRE</option>
-                </select>
-                <label class="control-label">Project</label>
-                <select name="project_id">{project_options}</select>
-                <button type="submit">Convert to task</button>
-              </form>
-            </article>
-            """
-        )
-    inbox_rows = "".join(rows) if rows else '<p class="muted">Inbox is clear.</p>'
-    return f'{new_capture_form}<div class="stack-list">{inbox_rows}</div>'
+
+def _render_trello_badges(*labels: tuple[str, str]) -> str:
+    chips = []
+    for tone, label in labels:
+        if not label:
+            continue
+        chips.append(f'<span class="trello-badge {html.escape(tone)}">{html.escape(label)}</span>')
+    return "".join(chips)
 
 
-def _render_closed_tasks(closed_tasks: list[dict[str, Any]]) -> str:
-    rows = []
-    for task in closed_tasks:
-        rows.append(
+def _render_trello_task_card(task: dict[str, Any]) -> str:
+    project_name = str(task.get("project_name") or "")
+    priority = str(task.get("priority") or "0")
+    badges = _render_trello_badges(
+        ("owner", str(task.get("owner") or "")),
+        ("project", project_name),
+        ("priority", f"P{priority}" if priority and priority != "0" else ""),
+    )
+    return f"""
+    <article class="kanban-card trello-card">
+      <div class="trello-badges">{badges}</div>
+      <div class="kanban-title trello-title">{html.escape(str(task.get('title') or 'Untitled task'))}</div>
+      <p class="kanban-copy trello-copy">{html.escape(str(task.get('next_action') or 'No next action yet.'))}</p>
+      {f'<p class="kanban-copy muted">{html.escape(str(task.get("blocker") or ""))}</p>' if task.get("blocker") else ''}
+      {_build_task_controls(task)}
+    </article>
+    """
+
+
+def _render_trello_capture_card(item: dict[str, Any], project_options: str) -> str:
+    default_title = (str(item.get("raw_text") or "Captured item").strip().splitlines()[0])[:96]
+    badges = _render_trello_badges(
+        ("capture", str(item.get("status") or "")),
+        ("capture", str(item.get("classification") or "capture")),
+    )
+    return f"""
+    <article class="kanban-card trello-card capture-card">
+      <div class="trello-badges">{badges}</div>
+      <div class="kanban-title trello-title">{html.escape(default_title or 'Captured item')}</div>
+      <p class="kanban-copy trello-copy">{html.escape(str(item.get('raw_text') or ''))}</p>
+      <details class="card-actions">
+        <summary>Convert to task</summary>
+        <form class="control-form" method="post" action="/captures/{html.escape(str(item['id']))}/task">
+          <label class="control-label">Task title</label>
+          <input type="text" name="title" value="{html.escape(default_title)}" required>
+          <label class="control-label">Owner</label>
+          <select name="owner">
+            <option value="ATHENA">ATHENA</option>
+            <option value="FLEIRE">FLEIRE</option>
+          </select>
+          <label class="control-label">Project</label>
+          <select name="project_id">{project_options}</select>
+          <button type="submit">Create task</button>
+        </form>
+      </details>
+    </article>
+    """
+
+
+def _render_trello_closed_card(task: dict[str, Any]) -> str:
+    badges = _render_trello_badges(
+        ("done", str(task.get("status") or "")),
+        ("project", str(task.get("project_name") or "")),
+    )
+    return f"""
+    <article class="kanban-card trello-card done-card">
+      <div class="trello-badges">{badges}</div>
+      <div class="kanban-title trello-title">{html.escape(str(task.get('title') or 'Closed task'))}</div>
+      <p class="kanban-copy trello-copy">{html.escape(str(task.get('completion_summary') or 'Closed without summary.'))}</p>
+      <details class="card-actions">
+        <summary>Reopen</summary>
+        {_build_reopen_form(str(task['id']), f"Follow-up needed for {task.get('title') or task['id']}")}
+      </details>
+    </article>
+    """
+
+
+def _render_board_lists(
+    kanban: dict[str, list[dict[str, Any]]],
+    inbox: list[dict[str, Any]],
+    closed_tasks: list[dict[str, Any]],
+    project_options: str,
+) -> str:
+    columns: list[tuple[str, str]] = []
+    if inbox:
+        inbox_cards = "".join(_render_trello_capture_card(item, project_options) for item in inbox)
+        columns.append(("Inbox", inbox_cards))
+
+    preferred = ["ATHENA", "FLEIRE", "BLOCKED", "SOMEDAY"]
+    seen: set[str] = set()
+    for bucket in preferred + sorted(kanban):
+        if bucket in seen or bucket not in kanban:
+            continue
+        seen.add(bucket)
+        cards = "".join(_render_trello_task_card(task) for task in kanban[bucket])
+        columns.append((bucket.title(), cards))
+
+    if closed_tasks:
+        done_cards = "".join(_render_trello_closed_card(task) for task in closed_tasks)
+        columns.append(("Done", done_cards))
+
+    if not columns:
+        return '<div class="empty-board">No lists yet.</div>'
+
+    rendered = []
+    for title, cards in columns:
+        count = cards.count('class="kanban-card')
+        rendered.append(
             f"""
-            <article class="item-card control-card">
-              <div class="item-field"><strong>title:</strong> {html.escape(str(task.get("title") or ""))}</div>
-              <div class="item-field"><strong>status:</strong> {html.escape(str(task.get("status") or ""))}</div>
-              <div class="item-field"><strong>project:</strong> {html.escape(str(task.get("project_name") or ""))}</div>
-              <div class="item-field"><strong>summary:</strong> {html.escape(str(task.get("completion_summary") or ""))}</div>
-              {_build_reopen_form(str(task["id"]), f"Follow-up needed for {task.get('title') or task['id']}")}
-            </article>
+            <section class="kanban-column trello-list">
+              <div class="trello-list-header">
+                <h3>{html.escape(title)}</h3>
+                <span class="trello-list-count">{count}</span>
+              </div>
+              <div class="trello-list-body">
+                {cards}
+              </div>
+            </section>
             """
         )
-    return "".join(rows) if rows else '<p class="muted">No recently closed tasks.</p>'
+    return "".join(rendered)
 
 
 def _render_project_control(projects: list[dict[str, Any]]) -> str:
@@ -611,9 +664,14 @@ def _render_html(data: dict[str, Any], banner_message: str | None = None, banner
     )
     sync_controls = _render_sync_controls()
     review_controls = _render_review_controls()
-    kanban_html = _render_kanban_columns(data.get("kanban", {}))
-    inbox_html = _render_capture_panel(data.get("inbox", []), _project_options(data.get("projects", [])))
-    closed_tasks_html = _render_closed_tasks(data.get("closed_tasks", []))
+    project_options = _project_options(data.get("projects", []))
+    board_html = _render_board_lists(
+        data.get("kanban", {}),
+        data.get("inbox", []),
+        data.get("closed_tasks", []),
+        project_options,
+    )
+    quick_capture_html = _render_quick_capture_form()
     project_control_html = _render_project_control(data.get("projects", []))
     life_parts = _render_items(data["life"]["areas"], ["name", "status", "priority", "notes"])
     life_goals = _render_items(data["life"]["goals"], ["title", "status", "horizon", "current_focus"])
@@ -679,20 +737,20 @@ def _render_html(data: dict[str, Any], banner_message: str | None = None, banner
       <section class="panel board-panel">
         <div class="panel-heading">
           <div>
-            <h2>Kanban board</h2>
-            <p>Group tasks by bucket and drive state transitions from here.</p>
+            <h2>Board</h2>
+            <p>Trello-style view of inbox, active work, blocked work, and done work.</p>
           </div>
           <div class="panel-actions">
-            <span class="muted">Buckets: {html.escape(buckets)}</span>
+            <span class="muted">Lists: {html.escape(buckets)}</span>
           </div>
         </div>
-        <div class="kanban-board">
-          {kanban_html}
+        <div class="trello-board">
+          {board_html}
         </div>
       </section>
       <section class="panel">
-        <h2>Capture Inbox</h2>
-        {inbox_html}
+        <h2>Quick Capture</h2>
+        {quick_capture_html}
       </section>
       <section class="panel">
         <h2>Portfolios & Projects</h2>
@@ -703,12 +761,6 @@ def _render_html(data: dict[str, Any], banner_message: str | None = None, banner
         <h2>Reviews</h2>
         <div class="sync-controls">
           {review_controls}
-        </div>
-      </section>
-      <section class="panel">
-        <h2>Closed Tasks</h2>
-        <div class="stack-list">
-          {closed_tasks_html}
         </div>
       </section>
       <section class="panel life-panel">
