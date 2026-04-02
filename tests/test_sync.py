@@ -10,6 +10,7 @@ from athena.config import default_paths
 from athena.db import connect_db, ensure_db, now_ts
 from athena.sync import (
     refresh_awareness_briefs,
+    run_sync,
     scan_project_repos,
     sync_life_docs,
     sync_notebooklm_exports,
@@ -24,6 +25,11 @@ def _test_paths(tmp_dir: Path):
         "workspace_telegram_root": tmp_dir / "workspace-telegram",
         "life_dir": tmp_dir / "life",
         "notebooklm_export_dir": tmp_dir / "life" / "notebooklm-exports",
+        "google_dir": tmp_dir / "workspace" / "system" / "google",
+        "google_settings_path": tmp_dir / "workspace" / "system" / "google" / "settings.json",
+        "google_client_secrets_path": tmp_dir / "workspace" / "system" / "google" / "client_secret.json",
+        "google_token_path": tmp_dir / "workspace" / "system" / "google" / "token.json",
+        "google_mirror_dir": tmp_dir / "workspace" / "system" / "google-mirror",
         "task_view_dir": tmp_dir / "workspace-telegram" / "task-system",
         "ledger_path": tmp_dir / "workspace" / "system" / "task-ledger" / "telegram-1937792843.md",
         "local_ledger_path": tmp_dir / "workspace-telegram" / "task-system" / "TELEGRAM_LEDGER.md",
@@ -160,6 +166,28 @@ class SyncTestCase(unittest.TestCase):
                 self.assertIn("global", scopes)
                 self.assertIn("portfolio", scopes)
                 self.assertIn("project", scopes)
+
+    def test_run_sync_google_ingests_local_notebook_exports(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            paths = _test_paths(tmp)
+            ensure_db(paths=paths)
+            paths.notebooklm_export_dir.mkdir(parents=True, exist_ok=True)
+            (paths.notebooklm_export_dir / "life-sync.txt").write_text("Life update from mirrored export.")
+
+            result = run_sync("google", paths=paths)
+
+            self.assertEqual(result["command"], "google")
+            self.assertEqual(result["notebook_exports"], 1)
+            with connect_db(paths.db_path) as conn:
+                row = conn.execute(
+                    "SELECT source_system, kind, summary FROM source_documents WHERE path LIKE ?",
+                    (f"%life-sync.txt",),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                self.assertEqual(row["source_system"], "NotebookLM")
+                self.assertEqual(row["kind"], "notebooklm")
+                self.assertEqual(row["summary"], "Life update from mirrored export.")
 
 
 if __name__ == "__main__":

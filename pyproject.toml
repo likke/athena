@@ -17,6 +17,7 @@ dependencies = []
 athena-taskctl = "athena.taskctl:main"
 athena-render = "athena.render_markdown:main"
 athena-sync = "athena.sync:main"
+athena-google = "athena.google:main"
 athena-board = "athena.server:main"
 
 [tool.setuptools.package-data]

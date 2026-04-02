@@ -13,7 +13,17 @@ from .db import (
     now_ts,
     query_all,
     query_one,
-    slugify,
+)
+from .google import GoogleAuthError, mirror_google_sources
+from .source_docs import (
+    TEXT_SUFFIXES,
+    choose_document_id,
+    default_document_id,
+    dedupe_source_documents,
+    iter_text_files,
+    text_summary,
+    title_from_path,
+    upsert_source_document,
 )
 
 
@@ -25,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("life", help="Sync the canonical life docs and NotebookLM exports.")
+    subparsers.add_parser("google", help="Mirror Gmail, Drive, and NotebookLM exports from Google.")
     subparsers.add_parser("repos", help="Scan project repos and refresh project health signals.")
     subparsers.add_parser("briefs", help="Refresh global, portfolio, and project awareness briefs.")
     subparsers.add_parser("all", help="Run life, repos, and briefs together.")
@@ -45,129 +56,14 @@ def _ensure_dir(path: Path) -> Path:
     return path
 
 
-def _text_summary(content: str) -> str:
-    fallback = ""
-    for line in content.splitlines():
-        clean = line.strip()
-        if not clean or clean == "---":
-            continue
-        if clean.startswith("#"):
-            if not fallback:
-                fallback = clean.lstrip("#").strip()
-            continue
-        if clean.startswith("- "):
-            return clean[2:].strip()
-        if clean:
-            return clean
-    return fallback
-
-
-def _title_from_path(path: Path) -> str:
-    return path.stem.replace("_", " ").replace("-", " ").title()
-
-
-def _path_variants(path: Path) -> tuple[str, ...]:
-    variants = {
-        str(path),
-        str(path.expanduser()),
-        str(path.expanduser().resolve()),
-    }
-    for candidate in list(variants):
-        if candidate.startswith("/private/var/"):
-            variants.add(candidate.removeprefix("/private"))
-        elif candidate.startswith("/var/"):
-            variants.add(f"/private{candidate}")
-    return tuple(sorted(variants))
-
-
-def _upsert_source_document(
-    conn,
-    doc_id: str,
-    kind: str,
-    title: str,
-    path: Path,
-    source_system: str,
-    is_authoritative: bool,
-    summary: str,
-    external_url: str | None = None,
-) -> None:
-    now = now_ts()
-    normalized_path = path.expanduser().resolve()
-    conn.execute(
-        """
-        INSERT INTO source_documents (id, kind, title, path, external_url, source_system, is_authoritative, last_synced_at, summary, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          kind = excluded.kind,
-          title = excluded.title,
-          path = excluded.path,
-          external_url = excluded.external_url,
-          source_system = excluded.source_system,
-          is_authoritative = excluded.is_authoritative,
-          last_synced_at = excluded.last_synced_at,
-          summary = excluded.summary,
-          updated_at = excluded.updated_at
-        """,
-        (
-            doc_id,
-            kind,
-            title,
-            str(normalized_path),
-            external_url,
-            source_system,
-            int(is_authoritative),
-            now,
-            summary,
-            now,
-            now,
-        ),
-    )
-
-
-def _choose_document_id(conn, path: Path, default_id: str) -> str:
-    variants = _path_variants(path)
-    placeholders = ", ".join(["?"] * len(variants))
-    existing = query_one(
-        conn,
-        f"""
-        SELECT id
-        FROM source_documents
-        WHERE path IN ({placeholders})
-        ORDER BY
-          CASE source_system
-            WHEN 'life-doc' THEN 0
-            WHEN 'local_markdown' THEN 1
-            WHEN 'NotebookLM' THEN 2
-            ELSE 3
-          END,
-          updated_at DESC,
-          created_at DESC
-        LIMIT 1
-        """,
-        variants,
-    )
-    return str(existing["id"]) if existing else default_id
-
-
-def _dedupe_source_documents(conn, path: Path, keep_id: str) -> None:
-    variants = _path_variants(path)
-    placeholders = ", ".join(["?"] * len(variants))
-    conn.execute(
-        f"DELETE FROM source_documents WHERE path IN ({placeholders}) AND id != ?",
-        (*variants, keep_id),
-    )
-
-
 def sync_life_docs(conn, life_dir: Path) -> list[str]:
     life_dir = _ensure_dir(life_dir)
     processed: list[str] = []
-    for entry in sorted(life_dir.glob("*.md")):
-        if not entry.is_file():
-            continue
-        title = _title_from_path(entry)
-        summary = _text_summary(entry.read_text(encoding="utf-8"))
-        doc_id = _choose_document_id(conn, entry, f"life-{slugify(entry.stem)}")
-        _upsert_source_document(
+    for entry in iter_text_files(life_dir, suffixes=TEXT_SUFFIXES):
+        title = title_from_path(entry)
+        summary = text_summary(entry.read_text(encoding="utf-8"))
+        doc_id = choose_document_id(conn, entry, default_document_id("life", entry))
+        upsert_source_document(
             conn,
             doc_id=doc_id,
             kind="life_doc",
@@ -177,7 +73,7 @@ def sync_life_docs(conn, life_dir: Path) -> list[str]:
             is_authoritative=True,
             summary=summary,
         )
-        _dedupe_source_documents(conn, entry, doc_id)
+        dedupe_source_documents(conn, entry, doc_id)
         processed.append(entry.name)
     return processed
 
@@ -187,13 +83,15 @@ def sync_notebooklm_exports(conn, notebook_dir: Path) -> list[str]:
         return []
     notebook_dir = notebook_dir.expanduser().resolve()
     processed: list[str] = []
-    for entry in sorted(notebook_dir.glob("*.md")):
-        if not entry.is_file():
-            continue
-        title = _title_from_path(entry)
-        summary = _text_summary(entry.read_text(encoding="utf-8"))
-        doc_id = _choose_document_id(conn, entry, f"notebooklm-{slugify(entry.stem)}")
-        _upsert_source_document(
+    for entry in iter_text_files(notebook_dir, suffixes=TEXT_SUFFIXES):
+        title = title_from_path(entry)
+        summary = text_summary(entry.read_text(encoding="utf-8"))
+        doc_id = choose_document_id(
+            conn,
+            entry,
+            default_document_id("notebooklm", entry),
+        )
+        upsert_source_document(
             conn,
             doc_id=doc_id,
             kind="notebooklm",
@@ -203,7 +101,7 @@ def sync_notebooklm_exports(conn, notebook_dir: Path) -> list[str]:
             is_authoritative=False,
             summary=summary,
         )
-        _dedupe_source_documents(conn, entry, doc_id)
+        dedupe_source_documents(conn, entry, doc_id)
         processed.append(entry.name)
     return processed
 
@@ -347,6 +245,21 @@ def run_sync(
 
     with connect_db(resolved_paths.db_path) as conn:
         summary: dict[str, object] = {"command": command, "db": str(resolved_paths.db_path)}
+        if command in ("google", "all"):
+            try:
+                google_summary = mirror_google_sources(conn, paths=resolved_paths)
+            except GoogleAuthError as exc:
+                google_summary = {
+                    "google_enabled": False,
+                    "gmail_messages": 0,
+                    "drive_files": 0,
+                    "notebooklm_files": 0,
+                    "google_error": str(exc),
+                }
+            summary.update(google_summary)
+            if command == "google":
+                mirrored_notebook = sync_notebooklm_exports(conn, resolved_notebook_dir)
+                summary["notebook_exports"] = len(mirrored_notebook)
         if command in ("life", "all"):
             processed = sync_life_docs(conn, resolved_life_dir)
             notebook = sync_notebooklm_exports(conn, resolved_notebook_dir)

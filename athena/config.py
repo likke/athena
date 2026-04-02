@@ -14,6 +14,11 @@ class AthenaPaths:
     db_path: Path
     life_dir: Path
     notebooklm_export_dir: Path
+    google_dir: Path
+    google_settings_path: Path
+    google_client_secrets_path: Path
+    google_token_path: Path
+    google_mirror_dir: Path
     task_view_dir: Path
     ledger_path: Path
     local_ledger_path: Path
@@ -63,6 +68,26 @@ def default_paths() -> AthenaPaths:
         "ATHENA_NOTEBOOKLM_EXPORT_DIR",
         life_dir / "notebooklm-exports",
     )
+    google_dir = _expand_env_path(
+        "ATHENA_GOOGLE_DIR",
+        workspace_root / "system" / "google",
+    )
+    google_settings_path = _expand_env_path(
+        "ATHENA_GOOGLE_SETTINGS_PATH",
+        google_dir / "settings.json",
+    )
+    google_client_secrets_path = _expand_env_path(
+        "ATHENA_GOOGLE_CLIENT_SECRETS_PATH",
+        google_dir / "client_secret.json",
+    )
+    google_token_path = _expand_env_path(
+        "ATHENA_GOOGLE_TOKEN_PATH",
+        google_dir / "token.json",
+    )
+    google_mirror_dir = _expand_env_path(
+        "ATHENA_GOOGLE_MIRROR_DIR",
+        workspace_root / "system" / "google-mirror",
+    )
     schema_path = repo_root / "athena/sql/schema.sql"
 
     return AthenaPaths(
@@ -73,6 +98,11 @@ def default_paths() -> AthenaPaths:
         db_path=db_path,
         life_dir=life_dir,
         notebooklm_export_dir=notebooklm_export_dir,
+        google_dir=google_dir,
+        google_settings_path=google_settings_path,
+        google_client_secrets_path=google_client_secrets_path,
+        google_token_path=google_token_path,
+        google_mirror_dir=google_mirror_dir,
         task_view_dir=task_view_dir,
         ledger_path=ledger_path,
         local_ledger_path=local_ledger_path,
