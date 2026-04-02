@@ -6,10 +6,11 @@ import hashlib
 import json
 import re
 import secrets
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -98,6 +99,15 @@ class GmailMirrorSettings:
 
 
 @dataclass(frozen=True)
+class CalendarSyncSettings:
+    enabled: bool = False
+    calendar_ids: tuple[str, ...] = ("primary",)
+    days_back: int = 0
+    days_ahead: int = 14
+    max_results: int = 25
+
+
+@dataclass(frozen=True)
 class DriveFolderSpec:
     id: str
     name: str
@@ -109,6 +119,7 @@ class GoogleSyncSettings:
     oauth_scopes: tuple[str, ...]
     include_granted_scopes: bool
     gmail: GmailMirrorSettings
+    calendar: CalendarSyncSettings
     drive_folders: tuple[DriveFolderSpec, ...]
     notebooklm_folder: DriveFolderSpec | None
 
@@ -223,6 +234,13 @@ def init_settings_template(paths: AthenaPaths | None = None, *, force: bool = Fa
             "query": "in:inbox category:primary newer_than:30d",
             "max_results": 15,
         },
+        "calendar": {
+            "enabled": True,
+            "calendar_ids": ["primary"],
+            "days_back": 0,
+            "days_ahead": 14,
+            "max_results": 25,
+        },
         "drive": {
             "folders": [
                 {
@@ -252,6 +270,7 @@ def load_sync_settings(paths: AthenaPaths | None = None) -> GoogleSyncSettings:
             oauth_scopes=(),
             include_granted_scopes=False,
             gmail=GmailMirrorSettings(),
+            calendar=CalendarSyncSettings(),
             drive_folders=(),
             notebooklm_folder=None,
         )
@@ -266,6 +285,15 @@ def load_sync_settings(paths: AthenaPaths | None = None) -> GoogleSyncSettings:
         enabled=bool(gmail.get("enabled", False)),
         query=str(gmail.get("query") or GmailMirrorSettings.query),
         max_results=int(gmail.get("max_results") or GmailMirrorSettings.max_results),
+    )
+    calendar = raw.get("calendar") or {}
+    calendar_ids = tuple(str(item).strip() for item in (calendar.get("calendar_ids") or ["primary"]) if str(item).strip())
+    calendar_settings = CalendarSyncSettings(
+        enabled=bool(calendar.get("enabled", False)),
+        calendar_ids=calendar_ids or CalendarSyncSettings.calendar_ids,
+        days_back=max(0, int(calendar.get("days_back") or CalendarSyncSettings.days_back)),
+        days_ahead=max(0, int(calendar.get("days_ahead") or CalendarSyncSettings.days_ahead)),
+        max_results=max(1, int(calendar.get("max_results") or CalendarSyncSettings.max_results)),
     )
 
     drive_folders: list[DriveFolderSpec] = []
@@ -294,6 +322,7 @@ def load_sync_settings(paths: AthenaPaths | None = None) -> GoogleSyncSettings:
         oauth_scopes=oauth_scopes,
         include_granted_scopes=include_granted_scopes,
         gmail=gmail_settings,
+        calendar=calendar_settings,
         drive_folders=tuple(drive_folders),
         notebooklm_folder=notebook_folder,
     )
@@ -510,10 +539,52 @@ def _iso_timestamp(raw_ms: str | int | None) -> str:
     return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()
 
 
+def _rfc3339_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _calendar_event_start(event: dict[str, Any]) -> tuple[str, bool]:
+    start = event.get("start") or {}
+    date_time = str(start.get("dateTime") or "").strip()
+    if date_time:
+        return date_time, False
+    return str(start.get("date") or "").strip(), True
+
+
+def _calendar_event_end(event: dict[str, Any]) -> str:
+    end = event.get("end") or {}
+    return str(end.get("dateTime") or end.get("date") or "").strip()
+
+
+def _calendar_event_when(event: dict[str, Any]) -> str:
+    start, all_day = _calendar_event_start(event)
+    end = _calendar_event_end(event)
+    if all_day:
+        return f"{start} (all day)" if start else "all day"
+    if start and end:
+        return f"{start} -> {end}"
+    return start or end or "unknown"
+
+
 def _write_text(path: Path, content: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return path
+
+
+def _google_error_message(exc: Exception) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+            payload = json.loads(detail)
+            message = str(((payload.get("error") or {}).get("message")) or "").strip()
+            if message:
+                return message
+        except Exception:
+            pass
+        return detail.strip() or str(exc)
+    return str(exc)
 
 
 def _mirror_gmail(conn, *, paths: AthenaPaths, settings: GmailMirrorSettings, transport: UrlLibTransport, access_token: str) -> dict[str, int]:
@@ -700,6 +771,141 @@ def _drive_download_text(
     return data.decode("utf-8", errors="replace"), suffix
 
 
+def _calendar_list_events(
+    *,
+    calendar_id: str,
+    access_token: str,
+    transport: UrlLibTransport,
+    days_back: int,
+    days_ahead: int,
+    max_results: int,
+) -> list[dict[str, Any]]:
+    now = datetime.now(tz=timezone.utc)
+    params = urllib.parse.urlencode(
+        {
+            "singleEvents": "true",
+            "orderBy": "startTime",
+            "timeMin": _rfc3339_timestamp(now - timedelta(days=days_back)),
+            "timeMax": _rfc3339_timestamp(now + timedelta(days=days_ahead)),
+            "maxResults": max_results,
+            "fields": "items(id,status,summary,description,location,htmlLink,start,end,organizer(displayName,email),attendees(email,responseStatus))",
+        }
+    )
+    response = transport.request_json(
+        "GET",
+        f"https://www.googleapis.com/calendar/v3/calendars/{urllib.parse.quote(calendar_id, safe='')}/events?{params}",
+        headers=_auth_headers(access_token),
+    )
+    return list(response.get("items") or [])
+
+
+def _mirror_calendar(
+    conn,
+    *,
+    paths: AthenaPaths,
+    settings: CalendarSyncSettings,
+    transport: UrlLibTransport,
+    access_token: str,
+) -> dict[str, int]:
+    base_dir = _ensure_dir(paths.google_mirror_dir / "calendar")
+    events_dir = _ensure_dir(base_dir / "events")
+    summary_lines = [
+        "# Upcoming Calendar Agenda",
+        "",
+        f"- calendar_ids: {', '.join(settings.calendar_ids)}",
+        f"- days_back: {settings.days_back}",
+        f"- days_ahead: {settings.days_ahead}",
+        "",
+    ]
+
+    mirrored = 0
+    for calendar_id in settings.calendar_ids:
+        events = _calendar_list_events(
+            calendar_id=calendar_id,
+            access_token=access_token,
+            transport=transport,
+            days_back=settings.days_back,
+            days_ahead=settings.days_ahead,
+            max_results=settings.max_results,
+        )
+        summary_lines.append(f"## {calendar_id}")
+        summary_lines.append("")
+        if not events:
+            summary_lines.append("- No upcoming events")
+            summary_lines.append("")
+            continue
+        for event in events:
+            if str(event.get("status") or "").lower() == "cancelled":
+                continue
+            event_id = str(event.get("id") or "").strip()
+            if not event_id:
+                continue
+            title = str(event.get("summary") or f"Calendar event {event_id}").strip()
+            when = _calendar_event_when(event)
+            location = str(event.get("location") or "").strip()
+            description = str(event.get("description") or "").strip()
+            html_link = str(event.get("htmlLink") or "").strip()
+            organizer = event.get("organizer") or {}
+            organizer_name = str(organizer.get("displayName") or organizer.get("email") or "").strip()
+            attendees = event.get("attendees") or []
+            attendee_lines = [
+                f"- {str(item.get('email') or 'unknown')} ({str(item.get('responseStatus') or 'unknown')})"
+                for item in attendees
+                if str(item.get("email") or "").strip()
+            ]
+            markdown_parts = [
+                f"# {title}",
+                "",
+                f"- calendar_id: {calendar_id}",
+                f"- when: {when}",
+                f"- location: {location or 'n/a'}",
+                f"- organizer: {organizer_name or 'unknown'}",
+                f"- status: {str(event.get('status') or 'confirmed')}",
+                f"- event_url: {html_link or 'n/a'}",
+                "",
+                "## Description",
+                "",
+                description or "(no description)",
+            ]
+            if attendee_lines:
+                markdown_parts.extend(["", "## Attendees", "", *attendee_lines])
+            markdown_parts.append("")
+            safe_event_id = re.sub(r"[^A-Za-z0-9._-]+", "-", event_id).strip("-") or "event"
+            mirror_path = _write_text(events_dir / f"{safe_event_id}.md", "\n".join(markdown_parts))
+            doc_id = choose_document_id(conn, mirror_path, f"gcal-{safe_event_id}")
+            upsert_source_document(
+                conn,
+                doc_id=doc_id,
+                kind="calendar_event",
+                title=title,
+                path=mirror_path,
+                source_system="gcal",
+                is_authoritative=False,
+                summary=text_summary(description or when or title),
+                external_url=html_link,
+            )
+            dedupe_source_documents(conn, mirror_path, doc_id)
+            summary_lines.append(f"- {when} — {title}")
+            mirrored += 1
+        summary_lines.append("")
+
+    summary_path = _write_text(base_dir / "upcoming-summary.md", "\n".join(summary_lines))
+    doc_id = choose_document_id(conn, summary_path, "gcal-upcoming-summary")
+    upsert_source_document(
+        conn,
+        doc_id=doc_id,
+        kind="calendar_agenda",
+        title="Upcoming Calendar Agenda",
+        path=summary_path,
+        source_system="gcal",
+        is_authoritative=False,
+        summary=f"{mirrored} mirrored calendar events",
+        external_url="https://calendar.google.com/calendar/u/0/r",
+    )
+    dedupe_source_documents(conn, summary_path, doc_id)
+    return {"calendar_events": mirrored}
+
+
 def _mirror_drive_folder(
     conn,
     *,
@@ -781,10 +987,16 @@ def mirror_google_sources(
 ) -> dict[str, Any]:
     resolved_paths = paths or default_paths()
     settings = load_sync_settings(resolved_paths)
-    if not settings.gmail.enabled and not settings.drive_folders and settings.notebooklm_folder is None:
+    if (
+        not settings.gmail.enabled
+        and not settings.calendar.enabled
+        and not settings.drive_folders
+        and settings.notebooklm_folder is None
+    ):
         return {
             "google_enabled": False,
             "gmail_messages": 0,
+            "calendar_events": 0,
             "drive_files": 0,
             "notebooklm_files": 0,
             "reason": "google settings are not configured",
@@ -795,48 +1007,72 @@ def mirror_google_sources(
     summary = {
         "google_enabled": True,
         "gmail_messages": 0,
+        "calendar_events": 0,
         "drive_files": 0,
         "notebooklm_files": 0,
     }
 
     if settings.gmail.enabled:
-        summary.update(
-            _mirror_gmail(
-                conn,
-                paths=resolved_paths,
-                settings=settings.gmail,
-                transport=transport,
-                access_token=access_token,
+        try:
+            summary.update(
+                _mirror_gmail(
+                    conn,
+                    paths=resolved_paths,
+                    settings=settings.gmail,
+                    transport=transport,
+                    access_token=access_token,
+                )
             )
-        )
+        except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+            summary["gmail_error"] = _google_error_message(exc)
+
+    if settings.calendar.enabled:
+        try:
+            summary.update(
+                _mirror_calendar(
+                    conn,
+                    paths=resolved_paths,
+                    settings=settings.calendar,
+                    transport=transport,
+                    access_token=access_token,
+                )
+            )
+        except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+            summary["calendar_error"] = _google_error_message(exc)
 
     drive_total = 0
-    for folder in settings.drive_folders:
-        drive_total += _mirror_drive_folder(
-            conn,
-            folder=folder,
-            output_dir=resolved_paths.google_mirror_dir / "drive" / folder.name.lower().replace(" ", "-"),
-            summary_dir=resolved_paths.google_mirror_dir / "drive",
-            access_token=access_token,
-            transport=transport,
-            source_system="gdrive",
-            kind="drive_file",
-            upsert_docs=True,
-        )
+    try:
+        for folder in settings.drive_folders:
+            drive_total += _mirror_drive_folder(
+                conn,
+                folder=folder,
+                output_dir=resolved_paths.google_mirror_dir / "drive" / folder.name.lower().replace(" ", "-"),
+                summary_dir=resolved_paths.google_mirror_dir / "drive",
+                access_token=access_token,
+                transport=transport,
+                source_system="gdrive",
+                kind="drive_file",
+                upsert_docs=True,
+            )
+    except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+        summary["drive_error"] = _google_error_message(exc)
     summary["drive_files"] = drive_total
 
     if settings.notebooklm_folder is not None:
-        summary["notebooklm_files"] = _mirror_drive_folder(
-            conn,
-            folder=settings.notebooklm_folder,
-            output_dir=resolved_paths.notebooklm_export_dir,
-            summary_dir=resolved_paths.google_mirror_dir / "notebooklm",
-            access_token=access_token,
-            transport=transport,
-            source_system="NotebookLM",
-            kind="notebooklm_export",
-            upsert_docs=False,
-        )
+        try:
+            summary["notebooklm_files"] = _mirror_drive_folder(
+                conn,
+                folder=settings.notebooklm_folder,
+                output_dir=resolved_paths.notebooklm_export_dir,
+                summary_dir=resolved_paths.google_mirror_dir / "notebooklm",
+                access_token=access_token,
+                transport=transport,
+                source_system="NotebookLM",
+                kind="notebooklm_export",
+                upsert_docs=False,
+            )
+        except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+            summary["notebooklm_error"] = _google_error_message(exc)
 
     return summary
 

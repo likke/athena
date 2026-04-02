@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 import urllib.parse
+from urllib.error import URLError
 from dataclasses import replace
 from pathlib import Path
 
@@ -58,12 +59,16 @@ class FakeTransport:
     def request_json(self, method: str, url: str, *, headers=None, data=None):
         for contains, payload in self.json_routes:
             if contains in url:
+                if isinstance(payload, Exception):
+                    raise payload
                 return payload
         raise AssertionError(f"Unexpected JSON request: {method} {url}")
 
     def request_bytes(self, method: str, url: str, *, headers=None, data=None) -> bytes:
         for contains, payload in self.byte_routes:
             if contains in url:
+                if isinstance(payload, Exception):
+                    raise payload
                 return payload
         raise AssertionError(f"Unexpected bytes request: {method} {url}")
 
@@ -202,6 +207,13 @@ class GoogleTestCase(unittest.TestCase):
                             "query": "in:inbox newer_than:30d",
                             "max_results": 1,
                         },
+                        "calendar": {
+                            "enabled": True,
+                            "calendar_ids": ["primary"],
+                            "days_back": 0,
+                            "days_ahead": 14,
+                            "max_results": 5,
+                        },
                         "drive": {
                             "folders": [
                                 {
@@ -259,6 +271,27 @@ class GoogleTestCase(unittest.TestCase):
                 },
             )
             transport.add_json(
+                "calendar/v3/calendars/primary/events?",
+                {
+                    "items": [
+                        {
+                            "id": "evt-1",
+                            "status": "confirmed",
+                            "summary": "Founder sync",
+                            "description": "Review priorities and deadlines.",
+                            "location": "Zoom",
+                            "htmlLink": "https://calendar.google.com/calendar/event?eid=evt-1",
+                            "start": {"dateTime": "2026-04-03T01:00:00Z"},
+                            "end": {"dateTime": "2026-04-03T02:00:00Z"},
+                            "organizer": {"email": "fleire@thirdteam.org", "displayName": "Fleire Castro"},
+                            "attendees": [
+                                {"email": "kent@example.com", "responseStatus": "accepted"},
+                            ],
+                        }
+                    ]
+                },
+            )
+            transport.add_json(
                 "drive/v3/files?q=%27drive-folder%27",
                 {
                     "files": [
@@ -292,9 +325,11 @@ class GoogleTestCase(unittest.TestCase):
                 conn.commit()
 
             self.assertEqual(result["gmail_messages"], 1)
+            self.assertEqual(result["calendar_events"], 1)
             self.assertEqual(result["drive_files"], 1)
             self.assertEqual(result["notebooklm_files"], 1)
             self.assertTrue((paths.google_mirror_dir / "gmail" / "msg-1.md").exists())
+            self.assertTrue((paths.google_mirror_dir / "calendar" / "events" / "evt-1.md").exists())
             self.assertTrue((paths.notebooklm_export_dir / "Notebook-Goals-note-1.txt").exists())
             with connect_db(paths.db_path) as conn:
                 rows = list(
@@ -303,11 +338,56 @@ class GoogleTestCase(unittest.TestCase):
                     )
                 )
                 source_kinds = {(row["source_system"], row["kind"]) for row in rows}
+                self.assertIn(("gcal", "calendar_event"), source_kinds)
+                self.assertIn(("gcal", "calendar_agenda"), source_kinds)
                 self.assertIn(("gmail", "gmail_message"), source_kinds)
                 self.assertIn(("gmail", "gmail_mailbox"), source_kinds)
                 self.assertIn(("gdrive", "drive_file"), source_kinds)
                 self.assertIn(("gdrive", "drive_file_summary"), source_kinds)
                 self.assertIn(("NotebookLM", "notebooklm_export_summary"), source_kinds)
+
+    def test_mirror_google_sources_reports_calendar_service_errors_without_crashing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            paths = _test_paths(tmp)
+            ensure_db(paths=paths)
+            paths.google_dir.mkdir(parents=True, exist_ok=True)
+            paths.google_settings_path.write_text(
+                json.dumps(
+                    {
+                        "calendar": {
+                            "enabled": True,
+                            "calendar_ids": ["primary"],
+                            "days_back": 0,
+                            "days_ahead": 14,
+                            "max_results": 5,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            paths.google_token_path.write_text(
+                json.dumps(
+                    {
+                        "access_token": "cached-access-token",
+                        "refresh_token": "refresh-token",
+                        "expiry": 4102444800,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            transport = FakeTransport()
+            calendar_error = URLError("Calendar API disabled")
+            transport.add_json("calendar/v3/calendars/primary/events?", calendar_error)
+
+            with connect_db(paths.db_path) as conn:
+                result = mirror_google_sources(conn, paths=paths, transport=transport)
+                conn.commit()
+
+            self.assertTrue(result["google_enabled"])
+            self.assertEqual(result["calendar_events"], 0)
+            self.assertIn("Calendar API disabled", result["calendar_error"])
 
     def test_list_drive_folders_uses_access_token_and_query(self):
         with tempfile.TemporaryDirectory() as tmpdir:

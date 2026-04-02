@@ -7,7 +7,7 @@ It keeps three layers in one place:
 - life context
 - portfolio and project status
 - execution truth
-- Google-aware mirrors for Gmail, Drive, and NotebookLM exports
+- Google-aware mirrors for Gmail, Calendar, Drive, and NotebookLM exports
 
 The app is designed to work against the same SQLite database already used by the live OpenClaw/Athena task-routing flow, so Telegram can keep using the current runtime while the board, sync jobs, and repo/project status live in a real codebase.
 
@@ -16,7 +16,7 @@ The app is designed to work against the same SQLite database already used by the
 - `athena.taskctl`: DB-first task state read/write helper
 - `athena.render_markdown`: generated compatibility views for Telegram bucket files
 - `athena.sync`: life-doc, awareness-brief, and repo-status sync commands
-- `athena.google`: local Google OAuth and Gmail / Drive / NotebookLM mirror helpers
+- `athena.google`: local Google OAuth and Gmail / Calendar / Drive / NotebookLM mirror helpers
 - `athena.server`: local HTTP dashboard / board
 
 ## Default Data Paths
@@ -46,7 +46,7 @@ Then open `http://127.0.0.1:8765`.
 
 Athena's own task, project, and life state stays local and writable. Google is only an awareness and source-import layer.
 
-1. In Google Cloud, enable the Gmail API and Google Drive API.
+1. In Google Cloud, enable the Gmail API, Google Calendar API, and Google Drive API.
 2. Create a Desktop OAuth client.
 3. Save the downloaded client secrets JSON to:
 
@@ -127,9 +127,14 @@ python3 -m athena.google list-folders --query "Athena"
 
 If OAuth succeeds but Gmail requests return `403 accessNotConfigured`, the Google Cloud project behind the Desktop OAuth client has not enabled the Gmail API yet. Enable it in Google Cloud Console for that same project, then retry the sync.
 
+### Calendar troubleshooting
+
+If Google sync reports a `calendar_error` with `accessNotConfigured`, the Google Cloud project behind the Desktop OAuth client has not enabled the Google Calendar API yet. Enable it for that same project, wait a few minutes, then rerun the sync.
+
 ### What gets mirrored
 
 - Gmail inbox messages into `~/.openclaw/workspace/system/google-mirror/gmail/`
+- upcoming calendar agenda and events into `~/.openclaw/workspace/system/google-mirror/calendar/`
 - text-capable Drive files into `~/.openclaw/workspace/system/google-mirror/drive/`
 - NotebookLM export files from a Drive folder into `~/.openclaw/workspace/life/notebooklm-exports/`
 
