@@ -9,12 +9,27 @@ from typing import Any
 from .config import default_paths
 from .db import connect_db, ensure_db, now_ts, row_to_dict
 from .render_markdown import render
+from .reviews import run_review_cycle
+from .rollups import refresh_rollups
+from .state import (
+    block_task,
+    capture_item,
+    create_task,
+    review_life_goal,
+    reopen_task,
+    set_chat_focus,
+    start_task,
+    triage_capture,
+    update_project_status,
+    complete_task,
+)
 
 DEFAULT_CHANNEL = "telegram"
 DEFAULT_CHAT_ID = "1937792843"
 OPEN_TASK_STATUSES = ("queued", "in_progress", "blocked", "someday")
 CLOSED_TASK_STATUSES = ("done", "cancelled")
 TASK_COLUMNS = (
+    "capture_id",
     "life_area_id",
     "life_goal_id",
     "portfolio_id",
@@ -32,16 +47,23 @@ TASK_COLUMNS = (
     "notes",
     "requires_approval",
     "requires_browser",
+    "required_for_project_completion",
     "dedupe_key",
     "source_channel",
     "source_chat_id",
     "source_message_ref",
+    "resolution",
+    "completion_summary",
+    "completion_record_id",
+    "reopened_at",
+    "reopen_reason",
     "created_at",
     "updated_at",
     "last_touched_at",
     "closed_at",
 )
 CHAT_STATE_COLUMNS = (
+    "current_capture_id",
     "active_life_area_id",
     "active_life_goal_id",
     "current_portfolio_id",
@@ -73,6 +95,130 @@ def parse_args() -> argparse.Namespace:
     current_parser = subparsers.add_parser("current", parents=[common], help="Show current state.")
     current_parser.add_argument("--channel", default=DEFAULT_CHANNEL)
     current_parser.add_argument("--chat-id", default=DEFAULT_CHAT_ID)
+
+    capture_parser = subparsers.add_parser("capture", parents=[common], help="Capture raw input into the inbox.")
+    capture_parser.add_argument("raw_text")
+    capture_parser.add_argument("--source-channel", default=DEFAULT_CHANNEL)
+    capture_parser.add_argument("--source-chat-id", default=DEFAULT_CHAT_ID)
+    capture_parser.add_argument("--source-message-ref", default=None)
+    capture_parser.add_argument("--classification", default=None)
+    capture_parser.add_argument("--linked-entity-kind", default=None)
+    capture_parser.add_argument("--linked-entity-id", default=None)
+    capture_parser.add_argument("--status", default=None)
+    capture_parser.add_argument("--note", default=None)
+    capture_parser.add_argument("--dedupe-key", default=None)
+    capture_parser.add_argument("--capture-id", default=None)
+
+    triage_parser = subparsers.add_parser("triage-capture", parents=[common], help="Triage an inbox item.")
+    triage_parser.add_argument("capture_id")
+    triage_parser.add_argument("--classification", required=True)
+    triage_parser.add_argument("--linked-entity-kind", default=None)
+    triage_parser.add_argument("--linked-entity-id", default=None)
+    triage_parser.add_argument("--status", default="triaged")
+    triage_parser.add_argument("--note", default=None)
+
+    create_parser = subparsers.add_parser("create-task", parents=[common], help="Create a task via the state layer.")
+    create_parser.add_argument("title")
+    create_parser.add_argument("--owner", required=True, choices=["ATHENA", "FLEIRE"])
+    create_parser.add_argument("--bucket", default=None)
+    create_parser.add_argument("--status", default="queued")
+    create_parser.add_argument("--task-id", default=None)
+    create_parser.add_argument("--project-id", default=None)
+    create_parser.add_argument("--portfolio-id", default=None)
+    create_parser.add_argument("--life-area-id", default=None)
+    create_parser.add_argument("--life-goal-id", default=None)
+    create_parser.add_argument("--workstream-id", default=None)
+    create_parser.add_argument("--source-text", default=None)
+    create_parser.add_argument("--why-now", default=None)
+    create_parser.add_argument("--next-action", default=None)
+    create_parser.add_argument("--blocker", default=None)
+    create_parser.add_argument("--notes", default=None)
+    create_parser.add_argument("--requires-approval", action="store_true")
+    create_parser.add_argument("--requires-browser", action="store_true")
+    create_parser.add_argument("--not-required-for-project-completion", action="store_true")
+    create_parser.add_argument("--source-channel", default=None)
+    create_parser.add_argument("--source-chat-id", default=None)
+    create_parser.add_argument("--source-message-ref", default=None)
+    create_parser.add_argument("--dedupe-key", default=None)
+    create_parser.add_argument("--capture-id", default=None)
+    create_parser.add_argument("--priority", type=int, default=0)
+    create_parser.add_argument("--actor", default="athena")
+
+    start_parser = subparsers.add_parser("start-task", parents=[common], help="Move a task into progress.")
+    start_parser.add_argument("task_id")
+    start_parser.add_argument("--next-action", default=None)
+    start_parser.add_argument("--note", default=None)
+    start_parser.add_argument("--actor", default="athena")
+
+    block_parser = subparsers.add_parser("block-task", parents=[common], help="Block a task with a concrete reason.")
+    block_parser.add_argument("task_id")
+    block_parser.add_argument("--blocker", required=True)
+    block_parser.add_argument("--next-action", default=None)
+    block_parser.add_argument("--note", default=None)
+    block_parser.add_argument("--requires-approval", action="store_true")
+    block_parser.add_argument("--requires-browser", action="store_true")
+    block_parser.add_argument("--actor", default="athena")
+
+    complete_parser = subparsers.add_parser("complete-task", parents=[common], help="Complete a task with evidence.")
+    complete_parser.add_argument("task_id")
+    complete_parser.add_argument("--summary", required=True)
+    complete_parser.add_argument("--resolution", default="done")
+    complete_parser.add_argument("--evidence", action="append", default=[])
+    complete_parser.add_argument("--verified-by", default=None)
+    complete_parser.add_argument("--note", default=None)
+    complete_parser.add_argument("--actor", default="athena")
+
+    reopen_parser = subparsers.add_parser("reopen-task", parents=[common], help="Reopen a closed task.")
+    reopen_parser.add_argument("task_id")
+    reopen_parser.add_argument("--reason", required=True)
+    reopen_parser.add_argument("--status", default="queued")
+    reopen_parser.add_argument("--bucket", default=None)
+    reopen_parser.add_argument("--next-action", default=None)
+    reopen_parser.add_argument("--actor", default="athena")
+
+    project_parser = subparsers.add_parser("project-status", parents=[common], help="Update project status or close it.")
+    project_parser.add_argument("project_id")
+    project_parser.add_argument("--status", default=None)
+    project_parser.add_argument("--health", default=None)
+    project_parser.add_argument("--blocker", default=None)
+    project_parser.add_argument("--current-goal", default=None)
+    project_parser.add_argument("--next-milestone", default=None)
+    project_parser.add_argument("--summary", default=None)
+    project_parser.add_argument("--completion-summary", default=None)
+    project_parser.add_argument("--completion-resolution", default="done")
+    project_parser.add_argument("--wins", default=None)
+    project_parser.add_argument("--risks", default=None)
+    project_parser.add_argument("--next-7-days", default=None)
+    project_parser.add_argument("--actor", default="athena")
+
+    goal_parser = subparsers.add_parser("review-goal", parents=[common], help="Review and update a life goal.")
+    goal_parser.add_argument("goal_id")
+    goal_parser.add_argument("--status", default=None)
+    goal_parser.add_argument("--current-focus", default=None)
+    goal_parser.add_argument("--status-note", default=None)
+    goal_parser.add_argument("--risk-if-ignored", default=None)
+    goal_parser.add_argument("--supporting-rule", default=None)
+    goal_parser.add_argument("--next-review-at", type=int, default=None)
+    goal_parser.add_argument("--actor", default="athena")
+
+    review_parser = subparsers.add_parser("review-cycle", parents=[common], help="Run daily, weekly, or monthly reviews.")
+    review_parser.add_argument("cadence", choices=["daily", "weekly", "monthly"])
+    review_parser.add_argument("--actor", default="athena")
+
+    rollup_parser = subparsers.add_parser("refresh-rollups", parents=[common], help="Refresh derived project and life rollups.")
+
+    focus_parser = subparsers.add_parser("set-chat-focus", parents=[common], help="Update chat focus pointers.")
+    focus_parser.add_argument("--channel", default=DEFAULT_CHANNEL)
+    focus_parser.add_argument("--chat-id", default=DEFAULT_CHAT_ID)
+    focus_parser.add_argument("--current-capture-id", default=None)
+    focus_parser.add_argument("--active-life-area-id", default=None)
+    focus_parser.add_argument("--active-life-goal-id", default=None)
+    focus_parser.add_argument("--current-portfolio-id", default=None)
+    focus_parser.add_argument("--current-project-id", default=None)
+    focus_parser.add_argument("--current-task-id", default=None)
+    focus_parser.add_argument("--last-user-intent", default=None)
+    focus_parser.add_argument("--last-progress", default=None)
+    focus_parser.add_argument("--pending-approval-task-id", default=None)
 
     return parser.parse_args()
 
@@ -117,6 +263,7 @@ def merge_task(existing: dict[str, Any] | None, payload: dict[str, Any]) -> dict
     merged["priority"] = int(merged["priority"] or 0)
     merged["requires_approval"] = int(merged["requires_approval"] or 0)
     merged["requires_browser"] = int(merged["requires_browser"] or 0)
+    merged["required_for_project_completion"] = int(merged["required_for_project_completion"] or 0)
     merged["created_at"] = int(merged["created_at"] or current_ts)
     merged["updated_at"] = int(payload.get("updated_at") or current_ts)
     merged["last_touched_at"] = int(payload.get("last_touched_at") or current_ts)
@@ -270,6 +417,7 @@ def apply_updates(db_path: Path, json_path: Path, skip_render: bool = False) -> 
         conn.commit()
 
     if should_render:
+        refresh_rollups(db_path=db_path)
         render(db_path=db_path)
     return {
         "ok": True,
@@ -290,6 +438,7 @@ def current_state(db_path: Path, channel: str, chat_id: str) -> dict[str, Any]:
                 SELECT
                   c.channel,
                   c.chat_id,
+                  c.current_capture_id,
                   c.current_task_id,
                   c.current_project_id,
                   c.current_portfolio_id,
@@ -297,6 +446,8 @@ def current_state(db_path: Path, channel: str, chat_id: str) -> dict[str, Any]:
                   c.last_user_intent,
                   c.last_progress,
                   c.updated_at,
+                  ci.raw_text AS current_capture_text,
+                  ci.status AS current_capture_status,
                   t.title AS current_task_title,
                   t.status AS current_task_status,
                   t.next_action AS current_task_next_action,
@@ -304,6 +455,7 @@ def current_state(db_path: Path, channel: str, chat_id: str) -> dict[str, Any]:
                   p.name AS current_project_name,
                   pf.name AS current_portfolio_name
                 FROM chat_state c
+                LEFT JOIN captured_items ci ON ci.id = c.current_capture_id
                 LEFT JOIN tasks t ON t.id = c.current_task_id
                 LEFT JOIN tasks pt ON pt.id = c.pending_approval_task_id
                 LEFT JOIN projects p ON p.id = c.current_project_id
@@ -340,6 +492,27 @@ def current_state(db_path: Path, channel: str, chat_id: str) -> dict[str, Any]:
                 (channel, chat_id, *OPEN_TASK_STATUSES),
             ).fetchall()
         ]
+        inbox_items = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT
+                  id,
+                  raw_text,
+                  classification,
+                  status,
+                  note,
+                  linked_entity_kind,
+                  linked_entity_id,
+                  updated_at
+                FROM captured_items
+                WHERE source_channel = ? AND source_chat_id = ? AND status IN ('new', 'triaged')
+                ORDER BY updated_at DESC
+                LIMIT 12
+                """,
+                (channel, chat_id),
+            ).fetchall()
+        ]
         recent_events = [
             dict(row)
             for row in conn.execute(
@@ -359,6 +532,7 @@ def current_state(db_path: Path, channel: str, chat_id: str) -> dict[str, Any]:
         "chat_id": chat_id,
         "current": current,
         "open_tasks": open_tasks,
+        "inbox_items": inbox_items,
         "recent_events": recent_events,
         "db": str(db_path),
     }
@@ -379,6 +553,152 @@ def main() -> int:
                 db_path=db_path,
                 channel=args.channel,
                 chat_id=args.chat_id,
+            )
+        elif args.command == "capture":
+            result = capture_item(
+                db_path=db_path,
+                raw_text=args.raw_text,
+                source_channel=args.source_channel,
+                source_chat_id=args.source_chat_id,
+                source_message_ref=args.source_message_ref,
+                classification=args.classification,
+                linked_entity_kind=args.linked_entity_kind,
+                linked_entity_id=args.linked_entity_id,
+                status=args.status,
+                note=args.note,
+                dedupe_key=args.dedupe_key,
+                capture_id=args.capture_id,
+            )
+        elif args.command == "triage-capture":
+            result = triage_capture(
+                db_path=db_path,
+                capture_id=args.capture_id,
+                classification=args.classification,
+                linked_entity_kind=args.linked_entity_kind,
+                linked_entity_id=args.linked_entity_id,
+                status=args.status,
+                note=args.note,
+            )
+        elif args.command == "create-task":
+            result = create_task(
+                db_path=db_path,
+                title=args.title,
+                owner=args.owner,
+                bucket=args.bucket,
+                status=args.status,
+                task_id=args.task_id,
+                project_id=args.project_id,
+                portfolio_id=args.portfolio_id,
+                life_area_id=args.life_area_id,
+                life_goal_id=args.life_goal_id,
+                workstream_id=args.workstream_id,
+                source_text=args.source_text,
+                why_now=args.why_now,
+                next_action=args.next_action,
+                blocker=args.blocker,
+                notes=args.notes,
+                requires_approval=bool(args.requires_approval),
+                requires_browser=bool(args.requires_browser),
+                required_for_project_completion=not bool(args.not_required_for_project_completion),
+                source_channel=args.source_channel,
+                source_chat_id=args.source_chat_id,
+                source_message_ref=args.source_message_ref,
+                dedupe_key=args.dedupe_key,
+                capture_id=args.capture_id,
+                priority=args.priority,
+                actor=args.actor,
+            )
+        elif args.command == "start-task":
+            result = start_task(
+                db_path=db_path,
+                task_id=args.task_id,
+                next_action=args.next_action,
+                note=args.note,
+                actor=args.actor,
+            )
+        elif args.command == "block-task":
+            result = block_task(
+                db_path=db_path,
+                task_id=args.task_id,
+                blocker=args.blocker,
+                next_action=args.next_action,
+                note=args.note,
+                requires_approval=True if args.requires_approval else None,
+                requires_browser=True if args.requires_browser else None,
+                actor=args.actor,
+            )
+        elif args.command == "complete-task":
+            result = complete_task(
+                db_path=db_path,
+                task_id=args.task_id,
+                summary=args.summary,
+                resolution=args.resolution,
+                evidence=args.evidence,
+                verified_by=args.verified_by,
+                note=args.note,
+                actor=args.actor,
+            )
+        elif args.command == "reopen-task":
+            result = reopen_task(
+                db_path=db_path,
+                task_id=args.task_id,
+                reason=args.reason,
+                status=args.status,
+                bucket=args.bucket,
+                next_action=args.next_action,
+                actor=args.actor,
+            )
+        elif args.command == "project-status":
+            result = update_project_status(
+                db_path=db_path,
+                project_id=args.project_id,
+                status=args.status,
+                health=args.health,
+                blocker=args.blocker,
+                current_goal=args.current_goal,
+                next_milestone=args.next_milestone,
+                summary=args.summary,
+                completion_summary=args.completion_summary,
+                completion_resolution=args.completion_resolution,
+                wins=args.wins,
+                risks=args.risks,
+                next_7_days=args.next_7_days,
+                actor=args.actor,
+            )
+        elif args.command == "review-goal":
+            result = review_life_goal(
+                db_path=db_path,
+                goal_id=args.goal_id,
+                status=args.status,
+                current_focus=args.current_focus,
+                status_note=args.status_note,
+                risk_if_ignored=args.risk_if_ignored,
+                supporting_rule=args.supporting_rule,
+                next_review_at=args.next_review_at,
+                actor=args.actor,
+            )
+        elif args.command == "review-cycle":
+            result = run_review_cycle(
+                cadence=args.cadence,
+                db_path=db_path,
+                actor=args.actor,
+            )
+        elif args.command == "refresh-rollups":
+            result = refresh_rollups(db_path=db_path)
+        elif args.command == "set-chat-focus":
+            result = set_chat_focus(
+                db_path=db_path,
+                channel=args.channel,
+                chat_id=args.chat_id,
+                current_capture_id=args.current_capture_id,
+                active_life_area_id=args.active_life_area_id,
+                active_life_goal_id=args.active_life_goal_id,
+                current_portfolio_id=args.current_portfolio_id,
+                current_project_id=args.current_project_id,
+                current_task_id=args.current_task_id,
+                last_user_intent=args.last_user_intent,
+                last_progress=args.last_progress,
+                pending_approval_task_id=args.pending_approval_task_id,
             )
         else:
             raise ValueError(f"Unsupported command: {args.command}")

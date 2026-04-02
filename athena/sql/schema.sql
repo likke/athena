@@ -22,7 +22,13 @@ CREATE TABLE IF NOT EXISTS life_goals (
   current_focus TEXT,
   supporting_rule TEXT,
   risk_if_ignored TEXT,
+  status_note TEXT,
   last_reviewed_at INTEGER,
+  next_review_at INTEGER,
+  completion_record_id INTEGER,
+  derived_status TEXT,
+  derived_summary TEXT,
+  rollup_updated_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -80,6 +86,15 @@ CREATE TABLE IF NOT EXISTS projects (
   next_milestone TEXT,
   blocker TEXT,
   notes TEXT,
+  status_source TEXT NOT NULL DEFAULT 'manual',
+  health_source TEXT NOT NULL DEFAULT 'derived',
+  derived_status TEXT,
+  derived_health TEXT,
+  rollup_summary TEXT,
+  rollup_updated_at INTEGER,
+  completion_summary TEXT,
+  completion_record_id INTEGER,
+  completion_mode TEXT,
   last_real_progress_at INTEGER,
   last_reviewed_at INTEGER,
   created_at INTEGER NOT NULL,
@@ -119,8 +134,39 @@ CREATE TABLE IF NOT EXISTS workstreams (
   updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS completion_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity_kind TEXT NOT NULL CHECK (entity_kind IN ('task', 'project', 'life_goal', 'workstream')),
+  entity_id TEXT NOT NULL,
+  resolution TEXT NOT NULL CHECK (resolution IN ('done', 'cancelled', 'superseded', 'merged')),
+  summary TEXT NOT NULL,
+  evidence_json TEXT,
+  completed_by TEXT NOT NULL,
+  verified_by TEXT,
+  completed_at INTEGER NOT NULL,
+  verified_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS captured_items (
+  id TEXT PRIMARY KEY,
+  source_channel TEXT,
+  source_chat_id TEXT,
+  source_message_ref TEXT,
+  dedupe_key TEXT UNIQUE,
+  raw_text TEXT NOT NULL,
+  classification TEXT CHECK (classification IN ('task', 'project_update', 'life_update', 'note', 'ignore')),
+  linked_entity_kind TEXT,
+  linked_entity_id TEXT,
+  status TEXT NOT NULL CHECK (status IN ('new', 'triaged', 'applied', 'ignored')),
+  note TEXT,
+  applied_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
+  capture_id TEXT,
   life_area_id TEXT REFERENCES life_areas(id) ON DELETE SET NULL,
   life_goal_id TEXT REFERENCES life_goals(id) ON DELETE SET NULL,
   portfolio_id TEXT REFERENCES portfolios(id) ON DELETE SET NULL,
@@ -138,6 +184,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   notes TEXT,
   requires_approval INTEGER NOT NULL DEFAULT 0 CHECK (requires_approval IN (0, 1)),
   requires_browser INTEGER NOT NULL DEFAULT 0 CHECK (requires_browser IN (0, 1)),
+  required_for_project_completion INTEGER NOT NULL DEFAULT 1 CHECK (required_for_project_completion IN (0, 1)),
+  resolution TEXT,
+  completion_summary TEXT,
+  completion_record_id INTEGER,
+  reopened_at INTEGER,
+  reopen_reason TEXT,
   dedupe_key TEXT UNIQUE,
   source_channel TEXT,
   source_chat_id TEXT,
@@ -173,6 +225,7 @@ CREATE TABLE IF NOT EXISTS project_updates (
 CREATE TABLE IF NOT EXISTS chat_state (
   channel TEXT NOT NULL,
   chat_id TEXT NOT NULL,
+  current_capture_id TEXT,
   active_life_area_id TEXT REFERENCES life_areas(id) ON DELETE SET NULL,
   active_life_goal_id TEXT REFERENCES life_goals(id) ON DELETE SET NULL,
   current_portfolio_id TEXT REFERENCES portfolios(id) ON DELETE SET NULL,
@@ -194,6 +247,15 @@ CREATE TABLE IF NOT EXISTS awareness_briefs (
   created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS review_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  cadence TEXT NOT NULL CHECK (cadence IN ('daily', 'weekly', 'monthly')),
+  findings_count INTEGER NOT NULL DEFAULT 0,
+  created_items_count INTEGER NOT NULL DEFAULT 0,
+  actor TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_life_goals_area ON life_goals(life_area_id, status);
 CREATE INDEX IF NOT EXISTS idx_projects_portfolio ON projects(portfolio_id, status);
 CREATE INDEX IF NOT EXISTS idx_projects_goal ON projects(life_goal_id, status);
@@ -203,3 +265,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_goal_status ON tasks(life_goal_id, status, 
 CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_project_updates_project ON project_updates(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_awareness_briefs_scope ON awareness_briefs(scope_kind, scope_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_captured_items_status ON captured_items(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_captured_items_channel ON captured_items(source_channel, source_chat_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_completion_records_entity ON completion_records(entity_kind, entity_id, completed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_review_runs_cadence ON review_runs(cadence, created_at DESC);

@@ -1,8 +1,13 @@
 import importlib
+import json
 import os
 import tempfile
+import threading
 import time
 import unittest
+import urllib.request
+import types
+import sys
 from pathlib import Path
 
 from athena import db as db_module
@@ -42,6 +47,17 @@ class AthenaServerTest(unittest.TestCase):
         self._env_backup = {key: os.environ.get(key) for key in self.ENV_KEYS}
         for key, value in env_values.items():
             os.environ[key] = value
+        self.state_calls: list[tuple[str, str]] = []
+        state_stub = types.SimpleNamespace(
+            capture_item=self._state_handler("capture"),
+            create_task=self._state_handler("create"),
+            start_task=self._state_handler("start"),
+            block_task=self._state_handler("block"),
+            complete_task=self._state_handler("complete"),
+            reopen_task=self._state_handler("reopen"),
+            update_project_status=self._state_handler("project"),
+        )
+        sys.modules["athena.state"] = state_stub
         self.paths = default_paths()
         db_module.ensure_db(paths=self.paths)
         self._insert_sample(self.paths.db_path)
@@ -57,6 +73,15 @@ class AthenaServerTest(unittest.TestCase):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        sys.modules.pop("athena.state", None)
+
+    def _state_handler(self, action: str):
+        def handler(*args, **kwargs):
+            target = kwargs.get("task_id") or kwargs.get("project_id") or kwargs.get("capture_id") or (args[0] if args else action)
+            self.state_calls.append((action, str(target)))
+            return {"ok": True, "action": action, "target": str(target)}
+
+        return handler
 
     def _insert_sample(self, db_path: Path) -> None:
         now = int(time.time())
@@ -106,6 +131,35 @@ class AthenaServerTest(unittest.TestCase):
     def test_render_html_contains_sections(self):
         data = self.server_module._gather_data(self.paths)
         html_blob = self.server_module._render_html(data)
-        self.assertIn("Life Context", html_blob)
+        self.assertIn("Life context", html_blob)
         self.assertIn("DashoContent", html_blob)
         self.assertIn("Tasks", html_blob)
+        self.assertIn("Capture Inbox", html_blob)
+
+    def test_api_endpoints_return_expected_payloads(self):
+        try:
+            httpd = self.server_module.create_server("127.0.0.1", 0, paths=self.paths)
+        except PermissionError:
+            self.skipTest("socket bind not permitted in this environment")
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        port = httpd.server_address[1]
+        base = f"http://127.0.0.1:{port}"
+
+        try:
+            tasks = json.loads(urllib.request.urlopen(f"{base}/api/tasks").read().decode("utf-8"))
+            self.assertTrue(any(row["id"] == "task-1" for row in tasks))
+
+            projects = json.loads(urllib.request.urlopen(f"{base}/api/projects").read().decode("utf-8"))
+            self.assertTrue(any(row["id"] == "project-1" for row in projects))
+
+            kanban = json.loads(urllib.request.urlopen(f"{base}/api/kanban").read().decode("utf-8"))
+            self.assertIn("ATHENA", kanban)
+
+            health = json.loads(urllib.request.urlopen(f"{base}/api/health").read().decode("utf-8"))
+            self.assertTrue(health["ok"])
+            self.assertTrue(str(health["db"]).endswith("tasks.sqlite"))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
