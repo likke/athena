@@ -8,6 +8,7 @@ from typing import Any
 
 from .config import default_paths
 from .db import connect_db, ensure_db, now_ts, row_to_dict
+from .google import search_gmail_messages
 from .outbox import (
     approve_outbox_items,
     create_email_outbox,
@@ -251,6 +252,11 @@ def parse_args() -> argparse.Namespace:
     send_outbox_parser = subparsers.add_parser("send-outbox", parents=[common], help="Send approved outbox items or a selected subset.")
     send_outbox_parser.add_argument("item_ids", nargs="*")
     send_outbox_parser.add_argument("--actor", default="athena")
+
+    gmail_search_parser = subparsers.add_parser("gmail-search", parents=[common], help="Search Gmail through the API instead of the browser.")
+    gmail_search_parser.add_argument("--query", required=True)
+    gmail_search_parser.add_argument("--max-results", type=int, default=10)
+    gmail_search_parser.add_argument("--account", default=None)
 
     return parser.parse_args()
 
@@ -987,6 +993,12 @@ def main() -> int:
                 db_path=db_path,
                 outbox_ids=args.item_ids or None,
                 actor=args.actor,
+            )
+        elif args.command == "gmail-search":
+            result = search_gmail_messages(
+                query=args.query,
+                account_label=args.account,
+                max_results=args.max_results,
             )
         else:
             raise ValueError(f"Unsupported command: {args.command}")

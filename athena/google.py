@@ -825,6 +825,24 @@ def _gmail_body(payload: dict[str, Any]) -> str:
     return "\n\n".join(item for item in html_fallback if item)
 
 
+def _gmail_attachment_names(payload: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+
+    def walk(part: dict[str, Any]) -> None:
+        filename = str(part.get("filename") or "").strip()
+        if filename:
+            names.append(filename)
+        for child in part.get("parts") or []:
+            walk(child)
+
+    walk(payload)
+    deduped: list[str] = []
+    for name in names:
+        if name not in deduped:
+            deduped.append(name)
+    return deduped
+
+
 def _gmail_raw_message(
     *,
     to_recipients: str,
@@ -919,6 +937,83 @@ def send_gmail_draft(
         "thread_id": str(response.get("threadId") or "").strip(),
         "label_ids": list(response.get("labelIds") or []),
         "external_url": "https://mail.google.com/mail/u/0/#sent",
+    }
+
+
+def search_gmail_messages(
+    *,
+    query: str,
+    paths: AthenaPaths | None = None,
+    transport: UrlLibTransport | None = None,
+    account_label: str | None = None,
+    max_results: int = 10,
+) -> dict[str, Any]:
+    resolved_paths = paths or default_paths()
+    account = resolve_gmail_account(resolved_paths, account_label=account_label)
+    transport = transport or UrlLibTransport()
+    access_token = ensure_access_token(resolved_paths, transport=transport, account_label=account.label)
+    cleaned_query = str(query).strip()
+    if not cleaned_query:
+        raise ValueError("query must not be empty")
+
+    bounded_max_results = max(1, min(int(max_results), 25))
+    params = urllib.parse.urlencode(
+        {
+            "q": cleaned_query,
+            "maxResults": bounded_max_results,
+        }
+    )
+    listing = transport.request_json(
+        "GET",
+        f"https://gmail.googleapis.com/gmail/v1/users/me/messages?{params}",
+        headers=_auth_headers(access_token),
+    )
+    messages = listing.get("messages") or []
+    results: list[dict[str, Any]] = []
+    for item in messages:
+        message_id = str(item.get("id") or "").strip()
+        if not message_id:
+            continue
+        detail = transport.request_json(
+            "GET",
+            f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{urllib.parse.quote(message_id)}?format=full",
+            headers=_auth_headers(access_token),
+        )
+        payload = detail.get("payload") or {}
+        subject = _gmail_header(payload, "Subject") or f"Gmail message {message_id}"
+        sender = _gmail_header(payload, "From")
+        recipients = _gmail_header(payload, "To")
+        date = _gmail_header(payload, "Date") or _iso_timestamp(detail.get("internalDate"))
+        snippet = str(detail.get("snippet") or "").strip()
+        body = _gmail_body(payload)
+        thread_id = str(detail.get("threadId") or item.get("threadId") or "").strip()
+        attachments = _gmail_attachment_names(payload)
+        results.append(
+            {
+                "message_id": message_id,
+                "thread_id": thread_id,
+                "subject": subject,
+                "from": sender,
+                "to": recipients,
+                "date": date,
+                "snippet": snippet,
+                "summary": text_summary(body or snippet or subject),
+                "attachment_names": attachments,
+                "label_ids": list(detail.get("labelIds") or []),
+                "external_url": f"https://mail.google.com/mail/u/0/#all/{thread_id or message_id}",
+            }
+        )
+
+    return {
+        "ok": True,
+        "mode": "gmail_api",
+        "account_label": account.label,
+        "account_email": account.email,
+        "query": cleaned_query,
+        "max_results": bounded_max_results,
+        "result_size_estimate": int(listing.get("resultSizeEstimate") or len(results)),
+        "matched_count": len(results),
+        "messages": results,
     }
 
 
@@ -1662,6 +1757,10 @@ def parse_args() -> argparse.Namespace:
 
     status_parser = subparsers.add_parser("status", help="Show local Google OAuth status for Athena.")
     status_parser.add_argument("--account", default=None)
+    search_parser = subparsers.add_parser("search-gmail", help="Search Gmail through the API instead of browser Gmail.")
+    search_parser.add_argument("--query", required=True)
+    search_parser.add_argument("--max-results", type=int, default=10)
+    search_parser.add_argument("--account", default=None)
     subparsers.add_parser("sync", help="Run the Google mirror pipeline once.")
     return parser.parse_args()
 
@@ -1710,6 +1809,15 @@ def main() -> int:
         result = oauth_status(paths, account_label=args.account)
         for key, value in result.items():
             print(f"{key}: {value}")
+        return 0
+    if args.command == "search-gmail":
+        result = search_gmail_messages(
+            query=args.query,
+            paths=paths,
+            account_label=args.account,
+            max_results=args.max_results,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=True))
         return 0
     if args.command == "list-folders":
         rows = list_drive_folders(

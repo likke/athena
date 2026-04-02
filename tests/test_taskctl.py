@@ -322,6 +322,48 @@ class TaskCtlTests(unittest.TestCase):
             approve_data = json.loads(stdout.getvalue())
             self.assertEqual(approve_data["updated_count"], 2)
 
+    def test_cli_gmail_search_routes_through_module(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "tasks.sqlite"
+
+            stdout = io.StringIO()
+            with patch(
+                "athena.taskctl.search_gmail_messages",
+                return_value={
+                    "ok": True,
+                    "mode": "gmail_api",
+                    "account_label": "primary",
+                    "query": "lorna",
+                    "matched_count": 1,
+                    "messages": [{"message_id": "msg-1"}],
+                },
+            ) as search_mock, patch(
+                "sys.argv",
+                [
+                    "taskctl",
+                    "gmail-search",
+                    "--db",
+                    str(db_path),
+                    "--query",
+                    "lorna",
+                    "--max-results",
+                    "5",
+                    "--account",
+                    "primary",
+                ],
+            ), contextlib.redirect_stdout(stdout):
+                exit_code = main()
+
+            self.assertEqual(exit_code, 0)
+            search_mock.assert_called_once()
+            self.assertEqual(search_mock.call_args.kwargs["query"], "lorna")
+            self.assertEqual(search_mock.call_args.kwargs["account_label"], "primary")
+            self.assertEqual(search_mock.call_args.kwargs["max_results"], 5)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["mode"], "gmail_api")
+            self.assertEqual(payload["matched_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

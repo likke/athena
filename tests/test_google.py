@@ -24,6 +24,7 @@ from athena.google import (
     mirror_google_sources,
     oauth_status,
     requested_scopes,
+    search_gmail_messages,
     send_gmail_draft,
 )
 
@@ -623,6 +624,110 @@ class GoogleTestCase(unittest.TestCase):
             )
             self.assertEqual(sent["message_id"], "sent-1")
             self.assertIn("SENT", sent["label_ids"])
+
+    def test_search_gmail_messages_uses_api_instead_of_browser(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            paths = _test_paths(tmp)
+            paths.google_dir.mkdir(parents=True, exist_ok=True)
+            paths.google_settings_path.write_text(
+                json.dumps(
+                    {
+                        "gmail": {
+                            "enabled": True,
+                            "default_account": "primary",
+                            "accounts": [
+                                {
+                                    "label": "primary",
+                                    "email": "fleire@thirdteam.org",
+                                    "display_name": "Fleire",
+                                    "default": True,
+                                }
+                            ],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            paths.google_token_path.write_text(
+                json.dumps(
+                    {
+                        "access_token": "cached-access-token",
+                        "refresh_token": "refresh-token",
+                        "expiry": 4102444800,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            body_text = "Lorna call transcript is attached for review."
+            encoded_body = base64.urlsafe_b64encode(body_text.encode("utf-8")).decode("ascii").rstrip("=")
+
+            transport = FakeTransport()
+            transport.add_json(
+                "gmail.googleapis.com/gmail/v1/users/me/messages?",
+                {
+                    "messages": [
+                        {
+                            "id": "msg-1",
+                            "threadId": "thread-1",
+                        }
+                    ],
+                    "resultSizeEstimate": 1,
+                },
+            )
+            transport.add_json(
+                "gmail.googleapis.com/gmail/v1/users/me/messages/msg-1?format=full",
+                {
+                    "id": "msg-1",
+                    "threadId": "thread-1",
+                    "internalDate": "1712100000000",
+                    "labelIds": ["INBOX", "UNREAD"],
+                    "snippet": "Transcript attached",
+                    "payload": {
+                        "mimeType": "multipart/mixed",
+                        "headers": [
+                            {"name": "Subject", "value": "Lorna transcript"},
+                            {"name": "From", "value": "sender@example.com"},
+                            {"name": "To", "value": "fleire@thirdteam.org"},
+                        ],
+                        "parts": [
+                            {
+                                "mimeType": "text/plain",
+                                "body": {"data": encoded_body},
+                            },
+                            {
+                                "mimeType": "application/pdf",
+                                "filename": "lorna-transcript.pdf",
+                                "body": {"attachmentId": "att-1"},
+                            },
+                        ],
+                    },
+                },
+            )
+
+            result = search_gmail_messages(
+                paths=paths,
+                query="lorna transcript",
+                account_label="primary",
+                max_results=5,
+                transport=transport,
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["mode"], "gmail_api")
+            self.assertEqual(result["account_label"], "primary")
+            self.assertEqual(result["account_email"], "fleire@thirdteam.org")
+            self.assertEqual(result["matched_count"], 1)
+            self.assertEqual(result["messages"][0]["subject"], "Lorna transcript")
+            self.assertIn("lorna-transcript.pdf", result["messages"][0]["attachment_names"])
+
+            listing_request = next(
+                request for request in transport.requests if "gmail.googleapis.com/gmail/v1/users/me/messages?" in str(request["url"])
+            )
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(str(listing_request["url"])).query)
+            self.assertEqual(params["q"], ["lorna transcript"])
+            self.assertEqual(params["maxResults"], ["5"])
 
 
 if __name__ == "__main__":
