@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "athena-os"
+version = "0.1.0"
+description = "Local-first life, portfolio, and task operating system for Athena."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Fleire Castro" }
+]
+dependencies = []
+
+[project.scripts]
+athena-taskctl = "athena.taskctl:main"
+athena-render = "athena.render_markdown:main"
+athena-sync = "athena.sync:main"
+athena-board = "athena.server:main"
+
+[tool.setuptools.package-data]
+athena = ["sql/schema.sql", "static/style.css"]
