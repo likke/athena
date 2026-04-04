@@ -1,26 +1,66 @@
 # Athena
 
-Athena is a local-first operating system for Fleire Castro.
+Athena is a local-first operating system **and** an LLM-maintained compounding wiki for Fleire Castro.
 
-It keeps three layers in one place:
+The original job was to keep three layers in one place:
 
 - life context
 - portfolio and project status
 - execution truth
+
+That is still true, but the current project is broader now:
+
 - Google-aware mirrors for Gmail, Calendar, Drive, and NotebookLM exports
 - Gmail draft approval and send tracking through a local outbox queue
+- a continuously maintained knowledge base that turns raw source material into clearer, linked, decision-useful memory over time
+
+The practical idea is close to Karpathy's style of a personal, evolving substrate for thought: Athena should not just store files or sync data. It should continuously improve the structure of memory by promoting important material into better-organized notes, indexes, summaries, and decision pages.
 
 The app is designed to work against the same SQLite database already used by the live OpenClaw/Athena task-routing flow, so Telegram can keep using the current runtime while the board, sync jobs, and repo/project status live in a real codebase.
+
+## Current Project Direction
+
+Athena now has two tightly connected roles:
+
+1. **operating system**
+   - tasks, projects, life docs, briefs, outbox, dashboards, sync jobs
+2. **compounding memory system**
+   - source ingestion, provenance tracking, source wrappers, promoted wiki pages, indexes, append-only logs, and linting
+
+The second role matters because raw accumulation is not enough. Athena should make the knowledge base more useful every week by:
+
+- importing new source material
+- preserving provenance
+- detecting duplicates and version candidates
+- promoting high-value source material into durable wiki pages
+- maintaining indexes for navigation
+- keeping an append-only operational log
+- linting the wiki so structure does not silently degrade
+
+This is already live in the current DashoContent knowledge-base work. Athena is no longer only a dashboard and sync layer; it is becoming a self-maintaining founder knowledge system.
+
+## Core Documents
+
+- `README.md`: high-level product and operating model
+- `docs/ARCHITECTURE.md`: how the operating system layer and compounding wiki layer fit together
+- `docs/COMPOUNDING_WIKI.md`: the current knowledge-system model
+- `docs/CURRENT_STATE.md`: what is live now vs still incomplete
+- `docs/IMPLEMENTATION_PLAN.md`: operational roadmap for the LLM-run wiki
+- `docs/JOB_SPECS.md`: concrete job definitions for scheduled wiki maintenance
 
 ## What This Repo Contains
 
 - `athena.taskctl`: DB-first task state read/write helper
 - `athena.outbox`: Gmail draft, approval, reject, and send state
 - `athena.render_markdown`: generated compatibility views for Telegram bucket files
-- `athena.sync`: life-doc, awareness-brief, and repo-status sync commands
+- `athena.sync`: life-doc, awareness-brief, repo-status, and mirror sync commands
 - `athena.synthesis`: weekly CEO brief generation from local Athena state
 - `athena.google`: local Google OAuth and Gmail / Calendar / Drive / NotebookLM helpers
 - `athena.server`: local HTTP dashboard / board with batch email approvals and a briefs view
+- `knowledge-base/`: the compounding wiki layer where Athena promotes source material into durable notes
+- `knowledge-base/scripts/import_drive_mirror.py`: source-wrapper generation plus wiki index/log refresh for Drive mirror imports
+- `knowledge-base/scripts/lint_wiki.py`: structural validation for the wiki layer
+- `knowledge-base/SCHEMA.md`: the operating contract for the knowledge system
 
 ## Default Data Paths
 
@@ -32,6 +72,7 @@ By default Athena reads and writes:
 - Google config: `~/.openclaw/workspace/system/google/`
 - Google mirror cache: `~/.openclaw/workspace/system/google-mirror/`
 - generated task views: `~/.openclaw/workspace-telegram/task-system/`
+- knowledge base workspace: `~/.openclaw/workspace-telegram/knowledge-base/`
 
 These can be overridden with environment variables when needed.
 
@@ -154,6 +195,40 @@ If Google sync reports a `calendar_error` with `accessNotConfigured`, the Google
 - a generated `ATHENA_LIFE_CONTEXT_BUNDLE.md` into `~/.openclaw/workspace/life/notebooklm-exports/` when that folder would otherwise be empty
 
 The important rule is: NotebookLM is not the source of truth. Athena mirrors the useful parts into local files and then ingests those into the normal `source_documents` layer.
+
+## Compounding Wiki Model
+
+Athena's knowledge-base is designed as an LLM-maintained compounding wiki.
+
+Core layers:
+
+1. **raw sources**
+   - mirrored or captured artifacts that should remain immutable
+2. **source wrappers**
+   - normalized metadata + provenance pages for imported material
+3. **wiki pages**
+   - synthesized, durable topic pages meant for fast founder use
+4. **indexes**
+   - generated navigation and intake overviews
+5. **append-only log**
+   - operational history of important wiki maintenance events
+
+Current operational rules:
+
+- preserve provenance instead of flattening it away
+- treat duplicates and revisions explicitly
+- promote only the highest-value source material into durable pages
+- keep pages easy to scan and source-cited
+- lint the wiki regularly so structure stays healthy
+
+This is the core of the current Athena project: not just collecting memory, but improving the shape of memory.
+
+A simple test:
+
+- if Athena accumulates more data but becomes noisier, it is regressing
+- if Athena accumulates more data and becomes easier to use, it is improving
+
+Right now the project direction is toward the second outcome.
 
 ## Weekly CEO Brief
 
