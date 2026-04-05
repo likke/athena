@@ -59,8 +59,9 @@ def now_ts() -> int:
 def connect_db(db_path: Path | None = None) -> sqlite3.Connection:
     paths = default_paths()
     resolved = (db_path or paths.db_path).expanduser().resolve()
-    conn = sqlite3.connect(resolved, factory=ClosingConnection)
+    conn = sqlite3.connect(resolved, timeout=30, factory=ClosingConnection)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 

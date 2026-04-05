@@ -122,12 +122,13 @@ def dedupe_source_documents(conn, path: Path, keep_id: str) -> None:
     )
 
 
-def iter_text_files(root: Path, *, suffixes: Iterable[str] = TEXT_SUFFIXES) -> list[Path]:
+def iter_text_files(root: Path, *, suffixes: Iterable[str] = TEXT_SUFFIXES, recursive: bool = False) -> list[Path]:
     if not root.exists():
         return []
     allowed = {suffix.lower() for suffix in suffixes}
     files: list[Path] = []
-    for entry in sorted(root.iterdir()):
+    iterator = root.rglob("*") if recursive else root.iterdir()
+    for entry in sorted(iterator):
         if not entry.is_file():
             continue
         if entry.suffix.lower() not in allowed:
@@ -137,4 +138,5 @@ def iter_text_files(root: Path, *, suffixes: Iterable[str] = TEXT_SUFFIXES) -> l
 
 
 def default_document_id(prefix: str, path: Path) -> str:
-    return f"{prefix}-{slugify(path.stem)}"
+    path_slug = slugify(path.expanduser().resolve().as_posix())
+    return f"{prefix}-{path_slug}"

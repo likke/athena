@@ -5,16 +5,19 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from athena.config import default_paths
 from athena.db import connect_db, ensure_db, now_ts
 from athena.synthesis import LATEST_WEEKLY_CEO_BRIEF, WEEKLY_CEO_BRIEF_KIND
 from athena.sync import (
+    LocalDriveReadTimeoutError,
     NOTEBOOKLM_LIFE_BUNDLE,
     ensure_notebooklm_life_bundle,
     refresh_awareness_briefs,
     run_sync,
     scan_project_repos,
+    sync_local_drive_folders,
     sync_life_docs,
     sync_notebooklm_exports,
 )
@@ -96,6 +99,175 @@ class SyncTestCase(unittest.TestCase):
                 north_summary = conn.execute("SELECT summary FROM source_documents WHERE id = 'doc_north_star'").fetchone()
                 self.assertEqual(north_summary["summary"], "Be clear.")
                 self.assertEqual([row["kind"] for row in rows if not row["is_authoritative"]], ["notebooklm"])
+
+    def test_sync_local_drive_folders_imports_recursive_text_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            paths = _test_paths(tmp)
+            ensure_db(paths=paths)
+            local_drive = tmp / "GoogleDrive" / "My Drive" / "Athena Drive Mirror"
+            nested = local_drive / "Collected Call Transcripts - 2026-04-03"
+            nested.mkdir(parents=True, exist_ok=True)
+            (local_drive / "Founder OS.md").write_text("# Founder OS\nKeep context tight.\n", encoding="utf-8")
+            (nested / "lorna.txt").write_text("Lorna transcript summary", encoding="utf-8")
+            (nested / "ignore.png").write_text("not text", encoding="utf-8")
+            paths.google_settings_path.parent.mkdir(parents=True, exist_ok=True)
+            paths.google_settings_path.write_text(
+                f"""
+{{
+  "drive": {{
+    "local_folders": [
+      {{
+        "name": "Athena Drive Mirror",
+        "path": "{local_drive}"
+      }}
+    ]
+  }}
+}}
+""".strip(),
+                encoding="utf-8",
+            )
+
+            with connect_db(paths.db_path) as conn:
+                result = sync_local_drive_folders(conn, paths)
+                conn.commit()
+
+            self.assertEqual(result["local_drive_files"], 2)
+            self.assertEqual(result["local_drive_folders"], 1)
+            summary_path = paths.google_mirror_dir / "drive-local" / "athena-drive-mirror-summary.md"
+            self.assertTrue(summary_path.exists())
+            summary_text = summary_path.read_text(encoding="utf-8")
+            self.assertIn("mirrored_files: 2", summary_text)
+            self.assertIn("Collected Call Transcripts - 2026-04-03/lorna.txt", summary_text)
+            with connect_db(paths.db_path) as conn:
+                rows = list(
+                    conn.execute(
+                        "SELECT source_system, kind, title FROM source_documents WHERE source_system = 'gdrive-local' ORDER BY title"
+                    )
+                )
+            self.assertEqual(
+                [(row["source_system"], row["kind"]) for row in rows],
+                [
+                    ("gdrive-local", "drive_file_summary"),
+                    ("gdrive-local", "drive_file"),
+                    ("gdrive-local", "drive_file"),
+                ],
+            )
+
+    def test_sync_local_drive_folders_skips_unreadable_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            paths = _test_paths(tmp)
+            ensure_db(paths=paths)
+            local_drive = tmp / "GoogleDrive" / "My Drive" / "Athena Drive Mirror"
+            local_drive.mkdir(parents=True, exist_ok=True)
+            good = local_drive / "Founder OS.md"
+            bad = local_drive / "Offloaded.md"
+            good.write_text("# Founder OS\nKeep context tight.\n", encoding="utf-8")
+            bad.write_text("placeholder", encoding="utf-8")
+            bad.chmod(0)
+            paths.google_settings_path.parent.mkdir(parents=True, exist_ok=True)
+            paths.google_settings_path.write_text(
+                f"""
+{{
+  "drive": {{
+    "local_folders": [
+      {{
+        "name": "Athena Drive Mirror",
+        "path": "{local_drive}"
+      }}
+    ]
+  }}
+}}
+""".strip(),
+                encoding="utf-8",
+            )
+
+            try:
+                with connect_db(paths.db_path) as conn:
+                    result = sync_local_drive_folders(conn, paths)
+                    conn.commit()
+            finally:
+                bad.chmod(0o644)
+
+            self.assertEqual(result["local_drive_files"], 1)
+            self.assertEqual(result["local_drive_skipped"], 1)
+            summary_path = paths.google_mirror_dir / "drive-local" / "athena-drive-mirror-summary.md"
+            summary_text = summary_path.read_text(encoding="utf-8")
+            self.assertIn("skipped: Offloaded.md", summary_text)
+            self.assertIn("skipped_files: 1", summary_text)
+            with connect_db(paths.db_path) as conn:
+                rows = list(
+                    conn.execute(
+                        "SELECT kind, title FROM source_documents WHERE source_system = 'gdrive-local' ORDER BY title"
+                    )
+                )
+            self.assertEqual(
+                [(row["kind"], row["title"]) for row in rows],
+                [
+                    ("drive_file_summary", "Athena Drive Mirror Local Summary"),
+                    ("drive_file", "Founder Os"),
+                ],
+            )
+
+    def test_sync_local_drive_folders_skips_timed_out_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            paths = _test_paths(tmp)
+            ensure_db(paths=paths)
+            local_drive = tmp / "GoogleDrive" / "My Drive" / "Athena Drive Mirror"
+            local_drive.mkdir(parents=True, exist_ok=True)
+            good = local_drive / "Founder OS.md"
+            slow = local_drive / "Slow.md"
+            good.write_text("# Founder OS\nKeep context tight.\n", encoding="utf-8")
+            slow.write_text("slow", encoding="utf-8")
+            paths.google_settings_path.parent.mkdir(parents=True, exist_ok=True)
+            paths.google_settings_path.write_text(
+                f"""
+{{
+  "drive": {{
+    "local_folders": [
+      {{
+        "name": "Athena Drive Mirror",
+        "path": "{local_drive}"
+      }}
+    ]
+  }}
+}}
+""".strip(),
+                encoding="utf-8",
+            )
+
+            from athena import sync as sync_module
+
+            def fake_read_local_text(path, *, timeout_seconds=2):
+                if path.name == slow.name:
+                    raise LocalDriveReadTimeoutError(f"Timed out reading {path}")
+                return path.read_text(encoding="utf-8", errors="replace")
+
+            with connect_db(paths.db_path) as conn:
+                with mock.patch.object(sync_module, "_read_local_text", new=fake_read_local_text):
+                    result = sync_local_drive_folders(conn, paths)
+                conn.commit()
+
+            self.assertEqual(result["local_drive_files"], 1)
+            self.assertEqual(result["local_drive_skipped"], 1)
+            summary_path = paths.google_mirror_dir / "drive-local" / "athena-drive-mirror-summary.md"
+            summary_text = summary_path.read_text(encoding="utf-8")
+            self.assertIn("skipped: Slow.md", summary_text)
+            with connect_db(paths.db_path) as conn:
+                rows = list(
+                    conn.execute(
+                        "SELECT kind, title FROM source_documents WHERE source_system = 'gdrive-local' ORDER BY title"
+                    )
+                )
+            self.assertEqual(
+                [(row["kind"], row["title"]) for row in rows],
+                [
+                    ("drive_file_summary", "Athena Drive Mirror Local Summary"),
+                    ("drive_file", "Founder Os"),
+                ],
+            )
 
     def test_ensure_notebooklm_life_bundle_generates_bundle_from_life_docs(self):
         with tempfile.TemporaryDirectory() as tmpdir:

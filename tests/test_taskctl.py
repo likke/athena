@@ -364,6 +364,102 @@ class TaskCtlTests(unittest.TestCase):
             self.assertEqual(payload["mode"], "gmail_api")
             self.assertEqual(payload["matched_count"], 1)
 
+    def test_cli_wiki_commands_route_through_module(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "tasks.sqlite"
+
+            stdout = io.StringIO()
+            with patch(
+                "athena.taskctl.skill_read",
+                return_value={"ok": True, "skill": "garmin"},
+            ) as skill_mock, patch(
+                "sys.argv",
+                [
+                    "taskctl",
+                    "skill-read",
+                    "--db",
+                    str(db_path),
+                    "--skill",
+                    "garmin",
+                    "--workspace",
+                    "telegram",
+                ],
+            ), contextlib.redirect_stdout(stdout):
+                exit_code = main()
+
+            self.assertEqual(exit_code, 0)
+            skill_mock.assert_called_once()
+            self.assertEqual(skill_mock.call_args.kwargs["skill_name"], "garmin")
+            self.assertEqual(skill_mock.call_args.kwargs["workspace"], "telegram")
+            self.assertEqual(json.loads(stdout.getvalue())["skill"], "garmin")
+
+            stdout = io.StringIO()
+            with patch(
+                "athena.taskctl.repo_discover",
+                return_value={"ok": True, "repo_count": 2},
+            ) as repo_mock, patch(
+                "sys.argv",
+                [
+                    "taskctl",
+                    "repo-discover",
+                    "--db",
+                    str(db_path),
+                    "--root",
+                    str(tmp_path),
+                    "--max-depth",
+                    "3",
+                ],
+            ), contextlib.redirect_stdout(stdout):
+                exit_code = main()
+
+            self.assertEqual(exit_code, 0)
+            repo_mock.assert_called_once()
+            self.assertEqual(repo_mock.call_args.kwargs["max_depth"], 3)
+            self.assertEqual(json.loads(stdout.getvalue())["repo_count"], 2)
+
+            stdout = io.StringIO()
+            with patch(
+                "athena.taskctl.connector_status",
+                return_value={"ok": True, "connectors": {}},
+            ) as connector_mock, patch(
+                "sys.argv",
+                ["taskctl", "connector-status", "--db", str(db_path), "--name", "garmin"],
+            ), contextlib.redirect_stdout(stdout):
+                exit_code = main()
+
+            self.assertEqual(exit_code, 0)
+            connector_mock.assert_called_once()
+            self.assertEqual(connector_mock.call_args.kwargs["name"], "garmin")
+
+            stdout = io.StringIO()
+            with patch(
+                "athena.taskctl.wiki_health",
+                return_value={"ok": True, "indexes_ok": True},
+            ) as health_mock, patch(
+                "sys.argv",
+                ["taskctl", "wiki-health", "--db", str(db_path)],
+            ), contextlib.redirect_stdout(stdout):
+                exit_code = main()
+
+            self.assertEqual(exit_code, 0)
+            health_mock.assert_called_once()
+            self.assertTrue(json.loads(stdout.getvalue())["indexes_ok"])
+
+            stdout = io.StringIO()
+            with patch(
+                "athena.taskctl.wiki_refresh",
+                return_value={"ok": True, "steps": []},
+            ) as refresh_mock, patch(
+                "sys.argv",
+                ["taskctl", "wiki-refresh", "--db", str(db_path)],
+            ), contextlib.redirect_stdout(stdout):
+                exit_code = main()
+
+            self.assertEqual(exit_code, 0)
+            refresh_mock.assert_called_once()
+            self.assertTrue(json.loads(stdout.getvalue())["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

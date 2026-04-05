@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
+import re
+import signal
 import subprocess
+import urllib.error
 from dataclasses import replace
 from pathlib import Path
 from typing import Iterable
@@ -28,6 +32,29 @@ from .source_docs import (
 from .synthesis import generate_weekly_ceo_brief
 
 NOTEBOOKLM_LIFE_BUNDLE = "ATHENA_LIFE_CONTEXT_BUNDLE.md"
+LOCAL_READ_TIMEOUT_SECONDS = 2
+
+
+class LocalDriveReadTimeoutError(TimeoutError):
+    pass
+
+
+def _read_local_text(path: Path, *, timeout_seconds: int = LOCAL_READ_TIMEOUT_SECONDS) -> str:
+    if not hasattr(signal, "SIGALRM"):
+        return path.read_text(encoding="utf-8", errors="replace")
+
+    previous = signal.getsignal(signal.SIGALRM)
+
+    def _handle_timeout(signum, frame):
+        raise LocalDriveReadTimeoutError(f"Timed out reading {path}")
+
+    signal.signal(signal.SIGALRM, _handle_timeout)
+    try:
+        signal.alarm(timeout_seconds)
+        return path.read_text(encoding="utf-8", errors="replace")
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def parse_args() -> argparse.Namespace:
@@ -139,6 +166,106 @@ def sync_notebooklm_exports(conn, notebook_dir: Path, *, life_dir: Path | None =
         dedupe_source_documents(conn, entry, doc_id)
         processed.append(entry.name)
     return processed
+
+
+def _slug_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "local-folder"
+
+
+def _load_local_drive_folders(paths: AthenaPaths) -> list[tuple[str, Path]]:
+    settings_path = paths.google_settings_path.expanduser().resolve()
+    if not settings_path.exists():
+        return []
+    raw = json.loads(settings_path.read_text(encoding="utf-8"))
+    folders: list[tuple[str, Path]] = []
+    for folder in ((raw.get("drive") or {}).get("local_folders") or []):
+        raw_path = str(folder.get("path") or "").strip()
+        if not raw_path:
+            continue
+        path = Path(raw_path).expanduser().resolve()
+        name = str(folder.get("name") or path.name or "Local Drive Folder").strip()
+        folders.append((name, path))
+    return folders
+
+
+def sync_local_drive_folders(conn, paths: AthenaPaths) -> dict[str, int]:
+    specs = _load_local_drive_folders(paths)
+    if not specs:
+        return {"local_drive_files": 0, "local_drive_folders": 0, "local_drive_skipped": 0}
+
+    summary_dir = _ensure_dir(paths.google_mirror_dir / "drive-local")
+    mirrored_files = 0
+    mirrored_folders = 0
+    skipped_files = 0
+
+    for name, folder_path in specs:
+        lines = [
+            f"# {name} Local Mirror",
+            "",
+            f"- path: {folder_path}",
+            f"- available: {'yes' if folder_path.exists() else 'no'}",
+        ]
+        local_count = 0
+        if folder_path.exists():
+            files = iter_text_files(folder_path, recursive=True)
+            lines.append(f"- mirrored_files: {len(files)}")
+            lines.append("")
+            for entry in files:
+                title = title_from_path(entry)
+                rel = entry.relative_to(folder_path)
+                try:
+                    content = _read_local_text(entry)
+                except OSError as exc:
+                    lines.append(f"- skipped: {rel} ({exc})")
+                    skipped_files += 1
+                    continue
+                summary = text_summary(content)
+                doc_id = choose_document_id(conn, entry, default_document_id("gdrive-local", entry))
+                upsert_source_document(
+                    conn,
+                    doc_id=doc_id,
+                    kind="drive_file",
+                    title=title,
+                    path=entry,
+                    source_system="gdrive-local",
+                    is_authoritative=False,
+                    summary=summary,
+                )
+                dedupe_source_documents(conn, entry, doc_id)
+                lines.append(f"- {rel}")
+                local_count += 1
+            mirrored_folders += 1
+        else:
+            lines.append("- mirrored_files: 0")
+
+        if skipped_files:
+            lines.append(f"- skipped_files: {skipped_files}")
+
+        summary_path = summary_dir / f"{_slug_name(name)}-summary.md"
+        summary_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+        summary_doc_id = choose_document_id(
+            conn,
+            summary_path,
+            default_document_id("gdrive-local", summary_path),
+        )
+        upsert_source_document(
+            conn,
+            doc_id=summary_doc_id,
+            kind="drive_file_summary",
+            title=f"{name} Local Summary",
+            path=summary_path,
+            source_system="gdrive-local",
+            is_authoritative=False,
+            summary=f"{local_count} local drive files from {name}",
+        )
+        dedupe_source_documents(conn, summary_path, summary_doc_id)
+        mirrored_files += local_count
+
+    return {
+        "local_drive_files": mirrored_files,
+        "local_drive_folders": mirrored_folders,
+        "local_drive_skipped": skipped_files,
+    }
 
 
 def _run_git(repo_path: Path, args: Iterable[str]) -> str | None:
@@ -283,7 +410,7 @@ def run_sync(
         if command in ("google", "all"):
             try:
                 google_summary = mirror_google_sources(conn, paths=resolved_paths)
-            except GoogleAuthError as exc:
+            except (GoogleAuthError, urllib.error.HTTPError, urllib.error.URLError) as exc:
                 google_summary = {
                     "google_enabled": False,
                     "gmail_messages": 0,
@@ -292,6 +419,7 @@ def run_sync(
                     "google_error": str(exc),
                 }
             summary.update(google_summary)
+            summary.update(sync_local_drive_folders(conn, resolved_paths))
             if command == "google":
                 mirrored_notebook = sync_notebooklm_exports(
                     conn,

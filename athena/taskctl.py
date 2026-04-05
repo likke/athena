@@ -31,6 +31,7 @@ from .state import (
     complete_task,
 )
 from .transcripts import collect_call_transcripts
+from .wiki_ops import connector_status, repo_discover, skill_read, wiki_health, wiki_refresh
 
 DEFAULT_CHANNEL = "telegram"
 DEFAULT_CHAT_ID = "1937792843"
@@ -264,6 +265,20 @@ def parse_args() -> argparse.Namespace:
     transcript_parser.add_argument("--destination", default=None)
     transcript_parser.add_argument("--account", default=None)
     transcript_parser.add_argument("--max-results-per-query", type=int, default=25)
+
+    skill_parser = subparsers.add_parser("skill-read", parents=[common], help="Read a skill file through a safe wrapper.")
+    skill_parser.add_argument("--skill", required=True)
+    skill_parser.add_argument("--workspace", default="telegram", choices=["telegram", "main"])
+
+    repo_parser = subparsers.add_parser("repo-discover", parents=[common], help="Discover repo/doc roots through a safe wrapper.")
+    repo_parser.add_argument("--root", default=None)
+    repo_parser.add_argument("--max-depth", type=int, default=4)
+
+    connector_parser = subparsers.add_parser("connector-status", parents=[common], help="Write or return structured wiki connector status.")
+    connector_parser.add_argument("--name", default=None, choices=["drive_mirror", "gmail", "notebooklm", "transcripts", "garmin"])
+
+    subparsers.add_parser("wiki-health", parents=[common], help="Summarize wiki health and connector states.")
+    subparsers.add_parser("wiki-refresh", parents=[common], help="Run the full wiki refresh pipeline.")
 
     return parser.parse_args()
 
@@ -1014,6 +1029,22 @@ def main() -> int:
                 account_label=args.account,
                 max_results_per_query=args.max_results_per_query,
             )
+        elif args.command == "skill-read":
+            result = skill_read(
+                skill_name=args.skill,
+                workspace=args.workspace,
+            )
+        elif args.command == "repo-discover":
+            result = repo_discover(
+                root=Path(args.root).expanduser().resolve() if args.root else None,
+                max_depth=args.max_depth,
+            )
+        elif args.command == "connector-status":
+            result = connector_status(name=args.name)
+        elif args.command == "wiki-health":
+            result = wiki_health()
+        elif args.command == "wiki-refresh":
+            result = wiki_refresh()
         else:
             raise ValueError(f"Unsupported command: {args.command}")
     except Exception as exc:  # pragma: no cover
