@@ -94,6 +94,21 @@ python3 -m athena.server --host 127.0.0.1 --port 8765
 
 Then open `http://127.0.0.1:8765`.
 
+## Live Wiki URLs
+
+Athena now exposes a wiki browse surface that is meant to feel more like a founder-specific Wikipedia than a file tree.
+
+Primary local routes:
+- board root: `http://127.0.0.1:8765`
+- wiki home: `http://127.0.0.1:8765/wiki`
+- wiki page route pattern: `http://127.0.0.1:8765/wiki/page/<slug>`
+
+Verified during the current implementation pass:
+- updated local verification instance: `http://127.0.0.1:8766/wiki`
+- verified example page: `http://127.0.0.1:8766/wiki/page/athena-fleire-os`
+
+If Athena is deployed behind another host, reverse proxy, or Pages-like surface, keep the public browse entrypoint documented here as the canonical wiki URL.
+
 ## Google Setup
 
 Athena's own task, project, and life state stays local and writable. Google is only an awareness and source-import layer.
