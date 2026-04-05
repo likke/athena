@@ -19,6 +19,7 @@ athena-render = "athena.render_markdown:main"
 athena-sync = "athena.sync:main"
 athena-google = "athena.google:main"
 athena-board = "athena.server:main"
+athena-wiki = "athena.wiki_jobs:main"
 
 [tool.setuptools.package-data]
 athena = ["sql/schema.sql", "static/style.css"]

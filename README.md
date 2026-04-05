@@ -1,6 +1,6 @@
 # Athena
 
-Athena is a local-first operating system **and** an LLM-maintained compounding wiki for Fleire Castro.
+Athena is a local-first operating system, an OpenClaw-run assistant execution layer, **and** an LLM-maintained compounding wiki for Fleire Castro.
 
 The original job was to keep three layers in one place:
 
@@ -9,6 +9,10 @@ The original job was to keep three layers in one place:
 - execution truth
 
 That is still true, but the current project is broader now:
+
+- an assistant/runtime layer that executes work through OpenClaw and persists operational state
+- portable deployment docs so Athena can be recreated on another machine with less guesswork
+- a live local wiki browsing layer on top of the markdown knowledge base
 
 - Google-aware mirrors for Gmail, Calendar, Drive, and NotebookLM exports
 - Gmail draft approval and send tracking through a local outbox queue
@@ -47,6 +51,7 @@ This is already live in the current DashoContent knowledge-base work. Athena is 
 - `docs/CURRENT_STATE.md`: what is live now vs still incomplete
 - `docs/IMPLEMENTATION_PLAN.md`: operational roadmap for the LLM-run wiki
 - `docs/JOB_SPECS.md`: concrete job definitions for scheduled wiki maintenance
+- `docs/WIKI_IMPLEMENTATION_SPEC.md`: code-facing contract for the first wiki jobs and scheduling hooks
 
 ## What This Repo Contains
 
@@ -57,6 +62,7 @@ This is already live in the current DashoContent knowledge-base work. Athena is 
 - `athena.synthesis`: weekly CEO brief generation from local Athena state
 - `athena.google`: local Google OAuth and Gmail / Calendar / Drive / NotebookLM helpers
 - `athena.server`: local HTTP dashboard / board with batch email approvals and a briefs view
+- `athena.wiki_jobs`: first runnable compounding-wiki jobs for promotion queueing, stale-page scans, and daily digests
 - `knowledge-base/`: the compounding wiki layer where Athena promotes source material into durable notes
 - `knowledge-base/scripts/import_drive_mirror.py`: source-wrapper generation plus wiki index/log refresh for Drive mirror imports
 - `knowledge-base/scripts/lint_wiki.py`: structural validation for the wiki layer

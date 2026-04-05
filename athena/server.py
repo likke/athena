@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 
@@ -74,6 +76,7 @@ class ServerState:
 APP_PAGES: tuple[tuple[str, str, str, str], ...] = (
     ("/", "Overview", "Mission control for what matters right now.", "Athena OS"),
     ("/board", "Board", "Inbox, active work, blocked work, and done.", "Execution"),
+    ("/wiki", "Wiki", "Browse Athena as a linked personal knowledge system.", "Knowledge"),
     ("/inbox", "Inbox", "Capture raw thoughts, triage loose ends, and keep intake clean.", "Capture"),
     ("/outbox", "Outbox", "Draft, approve, and send email without losing track.", "Approvals"),
     ("/projects", "Projects", "Track portfolio health, milestones, and repo reality.", "Portfolio"),
@@ -300,6 +303,170 @@ def _source_documents(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         LIMIT 20
         """,
     )
+
+
+def _wiki_root(paths: AthenaPaths) -> Path:
+    return paths.workspace_telegram_root / "knowledge-base" / "wiki"
+
+
+def _wiki_title_from_path(path: Path) -> str:
+    return path.stem.replace("-", " ")
+
+
+def _wiki_slug(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", title.casefold()).strip("-")
+
+
+def _wiki_linkify(text: str, slug_lookup: dict[str, str]) -> str:
+    escaped = html.escape(text)
+    escaped = re.sub(r"\[\[([^\]]+)\]\]", lambda m: _wiki_link_repl(m, slug_lookup), escaped)
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    return escaped
+
+
+def _wiki_link_repl(match: re.Match[str], slug_lookup: dict[str, str]) -> str:
+    title = match.group(1).strip()
+    slug = slug_lookup.get(title.casefold(), _wiki_slug(title))
+    return f'<a class="wiki-link" href="/wiki/page/{html.escape(slug)}">{html.escape(title)}</a>'
+
+
+def _wiki_render_markdown(body: str, slug_lookup: dict[str, str]) -> str:
+    blocks: list[str] = []
+    in_list = False
+    for raw_line in body.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            if in_list:
+                blocks.append("</ul>")
+                in_list = False
+            continue
+        if stripped.startswith("### "):
+            if in_list:
+                blocks.append("</ul>")
+                in_list = False
+            blocks.append(f"<h3>{_wiki_linkify(stripped[4:], slug_lookup)}</h3>")
+            continue
+        if stripped.startswith("## "):
+            if in_list:
+                blocks.append("</ul>")
+                in_list = False
+            blocks.append(f"<h2>{_wiki_linkify(stripped[3:], slug_lookup)}</h2>")
+            continue
+        if stripped.startswith("# "):
+            if in_list:
+                blocks.append("</ul>")
+                in_list = False
+            blocks.append(f"<h1>{_wiki_linkify(stripped[2:], slug_lookup)}</h1>")
+            continue
+        if stripped.startswith("- "):
+            if not in_list:
+                blocks.append('<ul class="wiki-list">')
+                in_list = True
+            blocks.append(f"<li>{_wiki_linkify(stripped[2:], slug_lookup)}</li>")
+            continue
+        if in_list:
+            blocks.append("</ul>")
+            in_list = False
+        blocks.append(f"<p>{_wiki_linkify(stripped, slug_lookup)}</p>")
+    if in_list:
+        blocks.append("</ul>")
+    return "\n".join(blocks) or '<p class="muted">No wiki content yet.</p>'
+
+
+def _wiki_pages(paths: AthenaPaths) -> list[dict[str, Any]]:
+    root = _wiki_root(paths)
+    if not root.exists():
+        return []
+    pages: list[dict[str, Any]] = []
+    for path in sorted(root.rglob("*.md")):
+        title = _wiki_title_from_path(path)
+        pages.append(
+            {
+                "title": title,
+                "slug": _wiki_slug(title),
+                "path": path,
+                "rel_path": str(path.relative_to(root)),
+                "content": path.read_text(encoding="utf-8"),
+            }
+        )
+    return pages
+
+
+def _wiki_graph(paths: AthenaPaths) -> dict[str, Any]:
+    pages = _wiki_pages(paths)
+    slug_lookup = {str(page["title"]).casefold(): str(page["slug"]) for page in pages}
+    title_lookup = {str(page["slug"]): str(page["title"]) for page in pages}
+    backlinks: dict[str, list[str]] = {str(page["slug"]): [] for page in pages}
+    for page in pages:
+        for match in re.findall(r"\[\[([^\]]+)\]\]", str(page["content"])):
+            target_slug = slug_lookup.get(match.strip().casefold())
+            if target_slug and target_slug != page["slug"]:
+                backlinks[target_slug].append(str(page["title"]))
+    for slug, items in backlinks.items():
+        backlinks[slug] = sorted(set(items), key=str.casefold)
+    return {
+        "pages": pages,
+        "slug_lookup": slug_lookup,
+        "title_lookup": title_lookup,
+        "backlinks": backlinks,
+    }
+
+
+def _render_wiki_home(paths: AthenaPaths) -> str:
+    graph = _wiki_graph(paths)
+    pages = graph["pages"]
+    lines = [
+        '<div class="wiki-home">',
+        '<div class="wiki-hero">',
+        '<h2>Fleire Castro Wiki</h2>',
+        '<p>A linked personal knowledge base maintained by Athena. Browse it like a founder-specific Wikipedia.</p>',
+        f'<p><strong>{len(pages)}</strong> pages currently available.</p>',
+        '</div>',
+        '<div class="wiki-directory">',
+    ]
+    for page in pages:
+        lines.append(
+            f'<a class="wiki-directory-item" href="/wiki/page/{html.escape(str(page["slug"]))}">'
+            f'<strong>{html.escape(str(page["title"]))}</strong>'
+            f'<span>{html.escape(str(page["rel_path"]))}</span>'
+            '</a>'
+        )
+    lines.extend(['</div>', '</div>'])
+    return "\n".join(lines)
+
+
+def _render_wiki_page(paths: AthenaPaths, slug: str) -> str | None:
+    graph = _wiki_graph(paths)
+    page = next((item for item in graph["pages"] if item["slug"] == slug), None)
+    if page is None:
+        return None
+    body = str(page["content"])
+    slug_lookup = graph["slug_lookup"]
+    backlinks = graph["backlinks"].get(slug, [])
+    backlink_html = (
+        "".join(
+            f'<li><a class="wiki-link" href="/wiki/page/{html.escape(graph["slug_lookup"].get(title.casefold(), _wiki_slug(title)))}">{html.escape(title)}</a></li>'
+            for title in backlinks
+        )
+        or '<li class="muted">No backlinks yet.</li>'
+    )
+    return f"""
+    <div class="wiki-page-shell">
+      <article class="wiki-article">
+        <div class="wiki-breadcrumbs"><a href="/wiki">Wiki</a> / {html.escape(str(page['title']))}</div>
+        <h1 class="wiki-title">{html.escape(str(page['title']))}</h1>
+        <div class="wiki-meta">Source: <code>{html.escape(str(page['rel_path']))}</code></div>
+        <div class="wiki-body">{_wiki_render_markdown(body, slug_lookup)}</div>
+      </article>
+      <aside class="wiki-sidebar">
+        <section class="wiki-sidecard">
+          <h3>Backlinks</h3>
+          <ul class="wiki-list">{backlink_html}</ul>
+        </section>
+      </aside>
+    </div>
+    """
 
 
 def _awareness_briefs(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -1419,6 +1586,8 @@ def _render_overview_page(data: dict[str, Any], *, current_path: str) -> str:
 
 def _render_page_body(data: dict[str, Any], *, current_path: str) -> str:
     project_options = _project_options(data.get("projects", []))
+    if current_path == "/wiki":
+        return _render_wiki_home(data["paths"])
     if current_path == "/board":
         return _render_board_page(data, current_path=current_path, project_options=project_options)
     if current_path == "/inbox":
@@ -1440,6 +1609,9 @@ def _render_html(
     current_path: str = "/",
     banner_message: str | None = None,
     banner_kind: str = "ok",
+    custom_page_label: str | None = None,
+    custom_page_description: str | None = None,
+    custom_page_body: str | None = None,
 ) -> str:
     safe_path = _safe_page_route(current_path)
     page = APP_PAGE_LOOKUP[safe_path]
@@ -1454,14 +1626,23 @@ def _render_html(
             f"{inbox_counts.get('new_items', 0)} inbox captures",
         ]
     )
-    page_body = _render_page_body(data, current_path=safe_path)
+    page_body = custom_page_body or _render_page_body(data, current_path=safe_path)
+    page_label = custom_page_label or str(page["label"])
+    page_description = custom_page_description or str(page["description"])
+    page_header = _render_page_header(safe_path).replace(
+        f"<h1>{html.escape(str(page['label']))}</h1>",
+        f"<h1>{html.escape(page_label)}</h1>",
+    ).replace(
+        f"<p>{html.escape(str(page['description']))}</p>",
+        f"<p>{html.escape(page_description)}</p>",
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{html.escape(str(page["label"]))} · Athena OS</title>
+    <title>{html.escape(page_label)} · Athena OS</title>
     <link rel="stylesheet" href="/static/style.css">
   </head>
   <body>
@@ -1469,7 +1650,7 @@ def _render_html(
       {_render_sidebar_nav(safe_path, data)}
       <main class="app-main">
         <div class="topline">{html.escape(topline)}</div>
-        {_render_page_header(safe_path)}
+        {page_header}
         {banner}
         <div class="page-content">
           {page_body}
@@ -1728,6 +1909,7 @@ class AthenaHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         if route in APP_PAGE_LOOKUP:
             data = _gather_data(paths)
+            data["paths"] = paths
             banner_message = query.get("notice", [query.get("synced", [None])[0]])[0]
             banner_kind = query.get("kind", ["ok"])[0]
             self._send_html(
@@ -1736,6 +1918,25 @@ class AthenaHandler(BaseHTTPRequestHandler):
                     current_path=route,
                     banner_message=banner_message,
                     banner_kind=banner_kind,
+                )
+            )
+            return
+        if route.startswith("/wiki/page/"):
+            slug = route.removeprefix("/wiki/page/").strip("/")
+            data = _gather_data(paths)
+            data["paths"] = paths
+            page_body = _render_wiki_page(paths, slug)
+            if page_body is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            page_title = next((str(item["title"]) for item in _wiki_pages(paths) if item["slug"] == slug), "Wiki page")
+            self._send_html(
+                _render_html(
+                    data,
+                    current_path="/wiki",
+                    custom_page_label=page_title,
+                    custom_page_description="Linked personal wiki page",
+                    custom_page_body=page_body,
                 )
             )
             return
