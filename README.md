@@ -43,6 +43,21 @@ The second role matters because raw accumulation is not enough. Athena should ma
 
 This is already live in the current DashoContent knowledge-base work. Athena is no longer only a dashboard and sync layer; it is becoming a self-maintaining founder knowledge system.
 
+## AI Coding Workflow
+
+Athena now treats **gstack** as the default methodology layer for coding work executed through OpenClaw/Claude Code.
+
+Default routing:
+- simple one-file edits: direct coding path
+- multi-file or implementation work: gstack-lite discipline
+- specialist review work: load the exact gstack skill (`/review`, `/qa`, `/cso`, `/benchmark`, `/investigate`)
+- feature or project work: `/office-hours` -> `/plan-eng-review` -> implementation -> `/review` -> `/qa` or `/qa-only` -> `/ship`
+- planning-only work: `/office-hours` -> `/autoplan`, then stop after saving the plan
+
+This matters because Athena is not only a memory system; it is also the execution layer. The goal is to make coding sessions more repeatable, more review-heavy, and easier to hand off between operator and spawned coding agents.
+
+See `docs/GSTACK_OPENCLAW.md` for the current Athena-specific integration notes.
+
 ## Core Documents
 
 - `README.md`: high-level product and operating model
